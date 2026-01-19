@@ -168,18 +168,32 @@ pub struct CacheTiers {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub promote_on_hit: bool,
+    #[serde(default = "default_promote_threshold")]
+    pub promote_threshold_hits: u32,
     #[serde(default)]
     pub write_through_cold: bool,
+    #[serde(default)]
+    pub max_hot_object_size: u64,
     #[serde(default)]
     pub demote_age_seconds: u64,
     #[serde(default)]
     pub demote_interval_seconds: u64,
+    #[serde(default = "default_demote_min_hits")]
+    pub demote_min_hits: u32,
+    #[serde(default)]
+    pub demote_min_range_ratio: f64,
     #[serde(default = "default_async_workers")]
     pub async_workers: usize,
     #[serde(default = "default_async_queue_size")]
     pub async_queue_size: usize,
     #[serde(default)]
     pub demote_batch: usize,
+    #[serde(default)]
+    pub retry_max: u32,
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    #[serde(default)]
+    pub rate_limit_per_sec: u32,
 }
 
 impl Default for CacheTiers {
@@ -187,12 +201,19 @@ impl Default for CacheTiers {
         Self {
             enabled: false,
             promote_on_hit: true,
+            promote_threshold_hits: default_promote_threshold(),
             write_through_cold: false,
+            max_hot_object_size: 0,
             demote_age_seconds: 0,
             demote_interval_seconds: 0,
+            demote_min_hits: default_demote_min_hits(),
+            demote_min_range_ratio: 0.0,
             async_workers: default_async_workers(),
             async_queue_size: default_async_queue_size(),
             demote_batch: 0,
+            retry_max: 0,
+            retry_backoff_ms: default_retry_backoff_ms(),
+            rate_limit_per_sec: 0,
         }
     }
 }
@@ -207,6 +228,18 @@ fn default_async_workers() -> usize {
 
 fn default_async_queue_size() -> usize {
     10000
+}
+
+fn default_promote_threshold() -> u32 {
+    1
+}
+
+fn default_demote_min_hits() -> u32 {
+    1
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    50
 }
 
 #[derive(Debug, Deserialize, Default)]

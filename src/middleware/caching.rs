@@ -913,7 +913,7 @@ fn serve_storage_range(
     }
     let bucket = bucket?;
     let meta = meta?;
-    storage::tiered::maybe_promote(bucket.as_ref(), &meta);
+    storage::tiered::on_storage_hit(bucket.as_ref(), &meta, true);
     let chunk_size = if meta.block_size > 0 {
         meta.block_size
     } else {
@@ -1130,7 +1130,8 @@ async fn handle_storage_hit(
     if !meta.has_complete() {
         return None;
     }
-    storage::tiered::maybe_promote(bucket.as_ref(), &meta);
+    let is_range = range_header.is_some();
+    storage::tiered::on_storage_hit(bucket.as_ref(), &meta, is_range);
     let body = read_storage_body(bucket.as_ref(), &meta).ok()?;
     let status = StatusCode::from_u16(meta.code as u16).unwrap_or(StatusCode::OK);
     let mut headers = header_map_from_meta(&meta);
@@ -1800,7 +1801,7 @@ fn store_to_storage(
 ) -> Option<CacheCompletedPayload> {
     let storage = storage::current();
     let id = Id::new(cache_key);
-    let bucket = storage.select_hot(&id)?;
+    let bucket = storage::tiered::select_write_bucket(&id, total_size)?;
     let body_size = body.len() as u64;
     let size = total_size;
     let mut chunks = ChunkSet::default();

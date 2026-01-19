@@ -134,11 +134,39 @@ fn disk_io_counter() -> &'static IntCounterVec {
     })
 }
 
+fn tiered_event_counter() -> &'static IntCounterVec {
+    static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new("tr_tavern_tiered_events_total", "Tiered migration events"),
+            &["event", "result"],
+        )
+        .unwrap();
+        registry().register(Box::new(counter.clone())).unwrap();
+        counter
+    })
+}
+
+fn tiered_queue_gauge() -> &'static IntGaugeVec {
+    static METRIC: OnceLock<IntGaugeVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let gauge = IntGaugeVec::new(
+            Opts::new("tr_tavern_tiered_queue_depth", "Tiered migration inflight"),
+            &[],
+        )
+        .unwrap();
+        registry().register(Box::new(gauge.clone())).unwrap();
+        gauge
+    })
+}
+
 fn init_metrics() {
     let _ = requests_total();
     let _ = requests_status_total();
     let _ = disk_usage_gauge();
     let _ = disk_io_counter();
+    let _ = tiered_event_counter();
+    let _ = tiered_queue_gauge();
     let codes = ["200", "206", "400", "404", "500"];
     for code in codes {
         requests_code_total()
@@ -185,6 +213,19 @@ pub fn record_disk_io(dev: &str, path: &str) {
     disk_io_counter()
         .with_label_values(&[dev, path])
         .inc();
+}
+
+pub fn record_tiered_event(event: &str, ok: bool) {
+    init_metrics();
+    let result = if ok { "ok" } else { "error" };
+    tiered_event_counter()
+        .with_label_values(&[event, result])
+        .inc();
+}
+
+pub fn set_tiered_queue_depth(depth: i64) {
+    init_metrics();
+    tiered_queue_gauge().with_label_values(&[]).set(depth);
 }
 
 pub fn render() -> String {

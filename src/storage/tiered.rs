@@ -7,6 +7,7 @@ use tokio::time::{self, Duration};
 use crate::config::CacheTiers;
 use crate::storage::object::{IdHash, Metadata};
 use crate::storage::{self, Bucket};
+use crate::metrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MigrationMode {
@@ -55,9 +56,16 @@ pub fn init(cfg: &CacheTiers) {
                     break;
                 };
                 let hash = task.meta.id.hash();
-                let _ = process_task(task).await;
+                let result = process_task_with_retry(task).await;
+                let ok = result.is_ok();
+                let event = match result {
+                    Ok(mode) => mode,
+                    Err(mode) => mode,
+                };
+                metrics::record_tiered_event(event, ok);
                 let mut inflight = migrator.inflight.lock().expect("migrator inflight");
                 inflight.remove(&hash);
+                metrics::set_tiered_queue_depth(inflight.len() as i64);
             }
         });
     }
@@ -75,10 +83,28 @@ pub fn enabled() -> bool {
     SETTINGS.get().map(|cfg| cfg.enabled).unwrap_or(false)
 }
 
-pub fn maybe_promote(bucket: &dyn Bucket, meta: &Metadata) {
+pub fn on_storage_hit(bucket: &dyn Bucket, meta: &Metadata, is_range: bool) {
     let cfg = SETTINGS.get();
-    if cfg.map(|c| c.enabled && c.promote_on_hit).unwrap_or(false)
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if !cfg.enabled {
+        return;
+    }
+    let storage = storage::current();
+    let key = format!("if/hit/{}", meta.id.hash_str());
+    let hits = storage
+        .shared_kv()
+        .incr(key.as_bytes(), 1)
+        .unwrap_or(0);
+    if is_range {
+        let rkey = format!("if/range/{}", meta.id.hash_str());
+        let _ = storage.shared_kv().incr(rkey.as_bytes(), 1);
+    }
+
+    if cfg.promote_on_hit
         && bucket.store_type().eq_ignore_ascii_case("cold")
+        && (cfg.promote_threshold_hits == 0 || hits >= cfg.promote_threshold_hits)
     {
         enqueue(MigrationTask {
             mode: MigrationMode::Promote,
@@ -103,6 +129,23 @@ pub fn maybe_write_through(bucket: &dyn Bucket, meta: &Metadata) {
     }
 }
 
+pub fn select_write_bucket(id: &storage::object::Id, size: u64) -> Option<Arc<dyn Bucket>> {
+    let cfg = SETTINGS.get();
+    let storage = storage::current();
+    let Some(cfg) = cfg else {
+        return storage.select_hot(id);
+    };
+    if !cfg.enabled {
+        return storage.select_hot(id);
+    }
+    if cfg.max_hot_object_size > 0 && size > cfg.max_hot_object_size {
+        if let Some(bucket) = storage.select_cold(id) {
+            return Some(bucket);
+        }
+    }
+    storage.select_hot(id)
+}
+
 fn enqueue(task: MigrationTask) {
     let Some(migrator) = MIGRATOR.get() else {
         return;
@@ -114,10 +157,43 @@ fn enqueue(task: MigrationTask) {
     }
     if migrator.tx.try_send(task).is_ok() {
         inflight.insert(hash);
+        metrics::set_tiered_queue_depth(inflight.len() as i64);
     }
 }
 
-async fn process_task(task: MigrationTask) -> anyhow::Result<()> {
+async fn process_task_with_retry(task: MigrationTask) -> Result<&'static str, &'static str> {
+    let mode = match task.mode {
+        MigrationMode::Promote => "promote",
+        MigrationMode::Demote => "demote",
+        MigrationMode::CopyToCold => "copy",
+    };
+    let cfg = SETTINGS.get().cloned().unwrap_or_default();
+    let mut attempt = 0u32;
+    loop {
+        if let Err(err) = process_task(&task).await {
+            attempt = attempt.saturating_add(1);
+            if cfg.retry_max == 0 || attempt > cfg.retry_max {
+                log::warn!("tiered {mode} failed: {err}");
+                return Err(mode);
+            }
+            let backoff = cfg.retry_backoff_ms.saturating_mul(1u64 << attempt.min(5));
+            time::sleep(Duration::from_millis(backoff)).await;
+            continue;
+        }
+        return Ok(mode);
+    }
+}
+
+async fn process_task(task: &MigrationTask) -> anyhow::Result<()> {
+    let cfg = SETTINGS.get().cloned().unwrap_or_default();
+    if cfg.rate_limit_per_sec > 0 {
+        let per_worker = (cfg.async_workers.max(1) as u64)
+            .saturating_mul(1_000)
+            / cfg.rate_limit_per_sec as u64;
+        if per_worker > 0 {
+            time::sleep(Duration::from_millis(per_worker)).await;
+        }
+    }
     let storage = storage::current();
     let Some(src) = storage.bucket_by_id(&task.from_bucket) else {
         return Ok(());
@@ -164,6 +240,7 @@ async fn demote_loop(interval: Duration, age_seconds: u64, max_batch: usize) {
     let mut ticker = time::interval(interval);
     loop {
         ticker.tick().await;
+        let cfg = SETTINGS.get().cloned().unwrap_or_default();
         let storage = storage::current();
         let hot_buckets = storage.hot_buckets();
         let cold_buckets = storage.cold_buckets();
@@ -179,6 +256,27 @@ async fn demote_loop(interval: Duration, age_seconds: u64, max_batch: usize) {
                 }
                 let age = now.saturating_sub(meta.resp_unix);
                 if age_seconds > 0 && age >= age_seconds as i64 {
+                    if cfg.demote_min_hits > 0 || cfg.demote_min_range_ratio > 0.0 {
+                        let hits = read_counter("if/hit", meta);
+                        let range_hits = read_counter("if/range", meta);
+                        let ratio = if hits == 0 {
+                            0.0
+                        } else {
+                            range_hits as f64 / hits as f64
+                        };
+                        if hits >= cfg.demote_min_hits
+                            && cfg.demote_min_range_ratio > 0.0
+                            && ratio >= cfg.demote_min_range_ratio
+                        {
+                            return Ok(());
+                        }
+                        if hits >= cfg.demote_min_hits && cfg.demote_min_range_ratio <= 0.0 {
+                            return Ok(());
+                        }
+                        if cfg.demote_min_range_ratio > 0.0 && ratio >= cfg.demote_min_range_ratio {
+                            return Ok(());
+                        }
+                    }
                     enqueue(MigrationTask {
                         mode: MigrationMode::Demote,
                         from_bucket: bucket.id().to_string(),
@@ -192,5 +290,20 @@ async fn demote_loop(interval: Duration, age_seconds: u64, max_batch: usize) {
                 break;
             }
         }
+    }
+}
+
+fn read_counter(prefix: &str, meta: &Metadata) -> u32 {
+    let storage = storage::current();
+    let key = format!("{prefix}/{}", meta.id.hash_str());
+    match storage.shared_kv().get(key.as_bytes()) {
+        Ok(raw) => {
+            if raw.len() >= 4 {
+                u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
     }
 }
