@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
-use http::{Response, StatusCode};
+use http::{HeaderValue, Response, StatusCode};
 use http_body_util::Full;
 use serde::Deserialize;
 use serde::Serialize;
@@ -12,7 +12,7 @@ use crate::plugin::{Plugin, Router};
 use crate::storage;
 use crate::storage::object::Metadata;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 struct ExampleOptions {
     #[serde(default)]
     option1: String,
@@ -30,16 +30,18 @@ impl Plugin for ExamplePlugin {
     }
 
     fn add_router(&self, router: &mut Router) {
-        router.add("/plugin/store/disk", |_req| {
+        let opts = self._options.clone();
+        router.add("/plugin/store/disk", move |_req| {
             let store = storage::current();
             let mut buckets = std::collections::HashMap::new();
             for bucket in store.buckets() {
                 buckets.insert(bucket.id().to_string(), bucket.objects());
             }
-            json_response(&buckets)
+            json_response_with_opts(&buckets, &opts)
         });
 
-        router.add("/plugin/store/object/simple", |req| {
+        let opts = self._options.clone();
+        router.add("/plugin/store/object/simple", move |req| {
             let store = storage::current();
             let use_hash = req
                 .uri()
@@ -53,10 +55,11 @@ impl Plugin for ExamplePlugin {
                     Ok(())
                 });
             }
-            json_response(&objects)
+            json_response_with_opts(&objects, &opts)
         });
 
-        router.add("/plugin/store/service-domains", |_req| {
+        let opts = self._options.clone();
+        router.add("/plugin/store/service-domains", move |_req| {
             let store = storage::current();
             let mut domain_map = std::collections::HashMap::<String, u32>::new();
             let _ = store.shared_kv().iterate_prefix(b"if/domain", &mut |key, val| {
@@ -67,7 +70,7 @@ impl Plugin for ExamplePlugin {
                 }
                 Ok(())
             });
-            json_response(&domain_map)
+            json_response_with_opts(&domain_map, &opts)
         });
     }
 }
@@ -159,4 +162,22 @@ fn json_response<T: Serialize>(payload: &T) -> Response<Full<Bytes>> {
             .body(Full::new(Bytes::new()))
             .unwrap(),
     }
+}
+
+fn json_response_with_opts<T: Serialize>(
+    payload: &T,
+    opts: &ExampleOptions,
+) -> Response<Full<Bytes>> {
+    let mut resp = json_response(payload);
+    if !opts.option1.is_empty() {
+        if let Ok(val) = HeaderValue::from_str(&opts.option1) {
+            resp.headers_mut().insert("X-Example-Option1", val);
+        }
+    }
+    if opts.option2 != 0 {
+        if let Ok(val) = HeaderValue::from_str(&opts.option2.to_string()) {
+            resp.headers_mut().insert("X-Example-Option2", val);
+        }
+    }
+    resp
 }

@@ -166,14 +166,28 @@ async fn send_report(
         .header("Content-Length", body.len().to_string())
         .body(Full::new(Bytes::from(body)))?;
 
-    let resp = tokio::time::timeout(Duration::from_secs(options.timeout), client.request(req))
-        .await??;
+    let resp = match tokio::time::timeout(Duration::from_secs(options.timeout), client.request(req))
+        .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => {
+            crate::metrics::record_verifier("0");
+            return Err(err.into());
+        }
+        Err(err) => {
+            crate::metrics::record_verifier("0");
+            return Err(anyhow!("report verifier timeout: {err}"));
+        }
+    };
     if resp.status() == StatusCode::CONFLICT {
+        crate::metrics::record_verifier("409");
         return Err(anyhow!("report verifier CRC hash conflict"));
     }
     if resp.status() != StatusCode::OK {
+        crate::metrics::record_verifier(&resp.status().as_u16().to_string());
         return Err(anyhow!("report verifier failed status {}", resp.status()));
     }
+    crate::metrics::record_verifier("200");
     Ok(())
 }
 

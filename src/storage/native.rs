@@ -22,11 +22,14 @@ pub struct NativeStorage {
 impl NativeStorage {
     pub fn new(cfg: &config::Storage) -> Result<Arc<Self>> {
         let shared_kv = build_shared_kv(cfg);
+        let _ = shared_kv.drop_prefix(b"if/domain/");
+        let _ = shared_kv.drop_prefix(b"ix/");
         let mut buckets: Vec<Arc<dyn crate::storage::Bucket>> = Vec::new();
         let mut bucket_by_id = HashMap::new();
 
         if cfg.buckets.is_empty() {
-            let bucket: Arc<dyn Bucket> = MemoryBucket::new("memory");
+            let bucket: Arc<dyn Bucket> =
+                MemoryBucket::new("memory", Arc::clone(&shared_kv), default_max_objects());
             bucket_by_id.insert(bucket.id().to_string(), Arc::clone(&bucket));
             buckets.push(bucket);
         } else {
@@ -36,8 +39,14 @@ impl NativeStorage {
                 } else {
                     bucket_cfg.db_type.as_str()
                 };
+                let max_objects = normalize_max_objects(bucket_cfg.max_object_limit);
+                let async_load = bucket_cfg.async_load || cfg.async_load;
                 let bucket: Arc<dyn Bucket> = match bucket_cfg.driver.as_str() {
-                    "memory" | "mem" => MemoryBucket::new(&format!("memory-{idx}")),
+                    "memory" | "mem" => MemoryBucket::new(
+                        &format!("memory-{idx}"),
+                        Arc::clone(&shared_kv),
+                        max_objects,
+                    ),
                     "empty" => EmptyBucket::new(&format!("empty-{idx}")),
                     _ => {
                         let path = if bucket_cfg.path.is_empty() {
@@ -55,7 +64,14 @@ impl NativeStorage {
                             PathBuf::from(&bucket_cfg.db_path)
                         };
                         let indexdb = indexdb::open(&db_path, db_type)?;
-                        DiskBucket::new(path, &format!("disk-{idx}"), indexdb)?
+                        DiskBucket::new(
+                            path,
+                            &format!("disk-{idx}"),
+                            indexdb,
+                            Arc::clone(&shared_kv),
+                            async_load,
+                            max_objects,
+                        )?
                     }
                 };
                 bucket_by_id.insert(bucket.id().to_string(), Arc::clone(&bucket));
@@ -163,6 +179,18 @@ fn build_shared_kv(cfg: &config::Storage) -> Arc<dyn SharedKV> {
         },
         "memory" | "mem" | "" => crate::storage::MemSharedKV::new(),
         _ => crate::storage::MemSharedKV::new(),
+    }
+}
+
+fn default_max_objects() -> Option<usize> {
+    Some(10_000_000)
+}
+
+fn normalize_max_objects(limit: i64) -> Option<usize> {
+    if limit <= 0 {
+        default_max_objects()
+    } else {
+        Some(limit as usize)
     }
 }
 

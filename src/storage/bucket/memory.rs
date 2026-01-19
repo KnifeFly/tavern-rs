@@ -5,22 +5,24 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 
+use crate::storage::bucket::lru::LruTracker;
 use crate::storage::indexdb::{IndexDB, SledIndexDB};
 use crate::storage::object::{Id, IdHash, Metadata};
-use crate::storage::{BoxedReader, BoxedWriter, Bucket};
+use crate::storage::{BoxedReader, BoxedWriter, Bucket, SharedKV};
 
-#[derive(Clone)]
 pub struct MemoryBucket {
     id: String,
     weight: i32,
     allow: i32,
     path: PathBuf,
     indexdb: Arc<dyn IndexDB>,
+    shared_kv: Arc<dyn SharedKV>,
+    lru: Mutex<LruTracker>,
     chunks: Arc<Mutex<HashMap<(IdHash, u32), Vec<u8>>>>,
 }
 
 impl MemoryBucket {
-    pub fn new(id: &str) -> Arc<Self> {
+    pub fn new(id: &str, shared_kv: Arc<dyn SharedKV>, max_objects: Option<usize>) -> Arc<Self> {
         let indexdb = SledIndexDB::temporary().expect("indexdb");
         Arc::new(Self {
             id: id.to_string(),
@@ -28,19 +30,63 @@ impl MemoryBucket {
             allow: 100,
             path: PathBuf::from("/"),
             indexdb,
+            shared_kv,
+            lru: Mutex::new(LruTracker::new(max_objects)),
             chunks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub fn new_with_indexdb(id: &str, indexdb: Arc<dyn IndexDB>) -> Arc<Self> {
+    pub fn new_with_indexdb(
+        id: &str,
+        indexdb: Arc<dyn IndexDB>,
+        shared_kv: Arc<dyn SharedKV>,
+        max_objects: Option<usize>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id: id.to_string(),
             weight: 100,
             allow: 100,
             path: PathBuf::from("/"),
             indexdb,
+            shared_kv,
+            lru: Mutex::new(LruTracker::new(max_objects)),
             chunks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn remove_shared_kv(&self, meta: &Metadata) {
+        let ix_key = format!("ix/{}/{}", self.id, meta.id.key());
+        let _ = self.shared_kv.delete(ix_key.as_bytes());
+        if let Ok(uri) = meta.id.path().parse::<http::Uri>() {
+            if let Some(host) = uri.host() {
+                let key = format!("if/domain/{host}");
+                let _ = self.shared_kv.decr(key.as_bytes(), 1);
+            }
+        }
+    }
+
+    fn touch_and_evict(&self, hash: IdHash) -> Result<()> {
+        let evicted = {
+            let mut lru = self.lru.lock().expect("lru");
+            lru.touch(hash)
+        };
+        for hash in evicted {
+            let _ = self.evict_hash(hash);
+        }
+        Ok(())
+    }
+
+    fn evict_hash(&self, hash: IdHash) -> Result<()> {
+        if let Some(meta) = self.indexdb.get(&hash.0)? {
+            self.remove_shared_kv(&meta);
+            self.discard_with_metadata(&meta)?;
+        }
+        Ok(())
+    }
+
+    fn remove_from_lru(&self, hash: IdHash) {
+        let mut lru = self.lru.lock().expect("lru");
+        lru.remove(&hash);
     }
 }
 
@@ -82,11 +128,17 @@ impl Bucket for MemoryBucket {
     }
 
     fn lookup(&self, id: &Id) -> Result<Option<Metadata>> {
-        self.indexdb.get(&id.hash().0)
+        let meta = self.indexdb.get(&id.hash().0)?;
+        if meta.is_some() {
+            let _ = self.touch_and_evict(id.hash());
+        }
+        Ok(meta)
     }
 
     fn store(&self, meta: &Metadata) -> Result<()> {
-        self.indexdb.set(&meta.id.hash().0, meta)
+        self.indexdb.set(&meta.id.hash().0, meta)?;
+        self.touch_and_evict(meta.id.hash())?;
+        Ok(())
     }
 
     fn exist(&self, hash: &[u8]) -> bool {
@@ -112,6 +164,7 @@ impl Bucket for MemoryBucket {
     }
 
     fn discard_with_metadata(&self, meta: &Metadata) -> Result<()> {
+        self.remove_from_lru(meta.id.hash());
         self.indexdb.delete(&meta.id.hash().0)?;
         let mut chunks = self.chunks.lock().expect("chunks");
         for idx in meta.chunks.iter() {

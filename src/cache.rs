@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::HeaderMap;
 use tokio::sync::RwLock;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
@@ -34,6 +35,7 @@ pub struct CacheEntry {
     pub status: http::StatusCode,
     pub body: Bytes,
     pub size: u64,
+    pub created_at: Instant,
     pub expires_at: Instant,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
@@ -70,40 +72,73 @@ impl CacheEntry {
 }
 
 #[derive(Debug, Default)]
+struct CacheInner {
+    map: HashMap<String, CacheEntry>,
+    order: VecDeque<String>,
+    max_entries: Option<usize>,
+}
+
+#[derive(Debug)]
 pub struct CacheStore {
-    inner: RwLock<HashMap<String, CacheEntry>>,
+    inner: RwLock<CacheInner>,
 }
 
 impl CacheStore {
     pub fn new() -> Self {
+        Self::new_with_limit(None)
+    }
+
+    pub fn new_with_limit(max_entries: Option<usize>) -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(CacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                max_entries: max_entries.filter(|v| *v > 0),
+            }),
         }
     }
 
     pub async fn get(&self, key: &str) -> Option<CacheEntry> {
-        let map = self.inner.read().await;
-        map.get(key).cloned()
+        let inner = self.inner.read().await;
+        inner.map.get(key).cloned()
     }
 
     pub async fn insert(&self, key: String, entry: CacheEntry) {
-        let mut map = self.inner.write().await;
-        map.insert(key, entry);
+        let mut inner = self.inner.write().await;
+        if !inner.map.contains_key(&key) {
+            if let Some(max) = inner.max_entries {
+                while inner.map.len() >= max {
+                    if let Some(old) = inner.order.pop_front() {
+                        inner.map.remove(&old);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            inner.order.push_back(key.clone());
+        }
+        inner.map.insert(key, entry);
     }
 
     pub async fn update<F>(&self, key: &str, updater: F)
     where
         F: FnOnce(&mut CacheEntry),
     {
-        let mut map = self.inner.write().await;
-        if let Some(entry) = map.get_mut(key) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.map.get_mut(key) {
             updater(entry);
         }
     }
 
     pub async fn remove(&self, key: &str) -> bool {
-        let mut map = self.inner.write().await;
-        map.remove(key).is_some()
+        let mut inner = self.inner.write().await;
+        if inner.map.remove(key).is_some() {
+            if let Some(pos) = inner.order.iter().position(|k| k == key) {
+                inner.order.remove(pos);
+            }
+            return true;
+        }
+        false
     }
 }
 

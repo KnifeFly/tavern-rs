@@ -1,33 +1,117 @@
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 
+use crate::storage::bucket::lru::LruTracker;
 use crate::storage::indexdb::IndexDB;
 use crate::storage::object::{Id, IdHash, Metadata};
-use crate::storage::{BoxedReader, BoxedWriter, Bucket};
+use crate::storage::{BoxedReader, BoxedWriter, Bucket, SharedKV};
+use crate::metrics;
 
-#[derive(Clone)]
 pub struct DiskBucket {
     id: String,
     weight: i32,
     allow: i32,
     path: PathBuf,
     indexdb: Arc<dyn IndexDB>,
+    shared_kv: Arc<dyn SharedKV>,
+    lru: Mutex<LruTracker>,
 }
 
 impl DiskBucket {
-    pub fn new(path: PathBuf, id: &str, indexdb: Arc<dyn IndexDB>) -> Result<Arc<Self>> {
+    pub fn new(
+        path: PathBuf,
+        id: &str,
+        indexdb: Arc<dyn IndexDB>,
+        shared_kv: Arc<dyn SharedKV>,
+        async_load: bool,
+        max_objects: Option<usize>,
+    ) -> Result<Arc<Self>> {
         fs::create_dir_all(&path)?;
-        Ok(Arc::new(Self {
+        let bucket = Arc::new(Self {
             id: id.to_string(),
             weight: 100,
             allow: 100,
             path,
             indexdb,
-        }))
+            shared_kv,
+            lru: Mutex::new(LruTracker::new(max_objects)),
+        });
+        let bucket_clone = Arc::clone(&bucket);
+        if async_load {
+            std::thread::spawn(move || bucket_clone.load_metadata());
+        } else {
+            bucket.load_metadata();
+        }
+        Ok(bucket)
+    }
+
+    fn load_metadata(&self) {
+        let _ = self.indexdb.iterate(None, &mut |_, meta| {
+            {
+                let mut lru = self.lru.lock().expect("lru");
+                lru.touch_no_evict(meta.id.hash());
+            }
+            self.update_shared_kv(meta);
+            true
+        });
+        let evicted = {
+            let mut lru = self.lru.lock().expect("lru");
+            lru.evict_overflow()
+        };
+        for hash in evicted {
+            let _ = self.evict_hash(hash);
+        }
+    }
+
+    fn update_shared_kv(&self, meta: &Metadata) {
+        if let Ok(uri) = meta.id.path().parse::<http::Uri>() {
+            if let Some(host) = uri.host() {
+                let key = format!("if/domain/{host}");
+                let _ = self.shared_kv.incr(key.as_bytes(), 1);
+            }
+        }
+        let ix_key = format!("ix/{}/{}", self.id, meta.id.key());
+        let _ = self.shared_kv.set(ix_key.as_bytes(), &meta.id.hash().0);
+    }
+
+    fn remove_shared_kv(&self, meta: &Metadata) {
+        let ix_key = format!("ix/{}/{}", self.id, meta.id.key());
+        let _ = self.shared_kv.delete(ix_key.as_bytes());
+        if let Ok(uri) = meta.id.path().parse::<http::Uri>() {
+            if let Some(host) = uri.host() {
+                let key = format!("if/domain/{host}");
+                let _ = self.shared_kv.decr(key.as_bytes(), 1);
+            }
+        }
+    }
+
+    fn touch_and_evict(&self, hash: IdHash) -> Result<()> {
+        let evicted = {
+            let mut lru = self.lru.lock().expect("lru");
+            lru.touch(hash)
+        };
+        for hash in evicted {
+            let _ = self.evict_hash(hash);
+        }
+        Ok(())
+    }
+
+    fn evict_hash(&self, hash: IdHash) -> Result<()> {
+        if let Some(meta) = self.indexdb.get(&hash.0)? {
+            self.remove_shared_kv(&meta);
+            self.discard_with_metadata(&meta)?;
+        }
+        Ok(())
+    }
+
+    fn remove_from_lru(&self, hash: IdHash) {
+        let mut lru = self.lru.lock().expect("lru");
+        lru.remove(&hash);
     }
 }
 
@@ -69,11 +153,17 @@ impl Bucket for DiskBucket {
     }
 
     fn lookup(&self, id: &Id) -> Result<Option<Metadata>> {
-        self.indexdb.get(&id.hash().0)
+        let meta = self.indexdb.get(&id.hash().0)?;
+        if meta.is_some() {
+            let _ = self.touch_and_evict(id.hash());
+        }
+        Ok(meta)
     }
 
     fn store(&self, meta: &Metadata) -> Result<()> {
-        self.indexdb.set(&meta.id.hash().0, meta)
+        self.indexdb.set(&meta.id.hash().0, meta)?;
+        self.touch_and_evict(meta.id.hash())?;
+        Ok(())
     }
 
     fn exist(&self, hash: &[u8]) -> bool {
@@ -99,6 +189,7 @@ impl Bucket for DiskBucket {
     }
 
     fn discard_with_metadata(&self, meta: &Metadata) -> Result<()> {
+        self.remove_from_lru(meta.id.hash());
         self.indexdb.delete(&meta.id.hash().0)?;
         for idx in meta.chunks.iter() {
             let path = meta.id.wpath_slice(&self.path, *idx);
@@ -122,12 +213,20 @@ impl Bucket for DiskBucket {
             fs::create_dir_all(parent)?;
         }
         let file = File::create(&path)?;
+        let dev = fs::metadata(&self.path)
+            .map(|m| m.dev().to_string())
+            .unwrap_or_else(|_| "-".to_string());
+        metrics::record_disk_io(&dev, &self.path.to_string_lossy());
         Ok((Box::new(file), path))
     }
 
     fn read_chunk_file(&self, id: &Id, index: u32) -> Result<(BoxedReader, PathBuf)> {
         let path = id.wpath_slice(&self.path, index);
         let file = File::open(&path)?;
+        let dev = fs::metadata(&self.path)
+            .map(|m| m.dev().to_string())
+            .unwrap_or_else(|_| "-".to_string());
+        metrics::record_disk_io(&dev, &self.path.to_string_lossy());
         Ok((Box::new(BufReader::new(file)), path))
     }
 }

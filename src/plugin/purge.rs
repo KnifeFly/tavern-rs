@@ -1,4 +1,9 @@
 use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -34,6 +39,14 @@ fn default_header_name() -> String {
 pub struct PurgePlugin {
     options: PurgeOptions,
     allow_hosts: HashSet<String>,
+    log_writer: Option<Mutex<std::fs::File>>,
+    threshold_window: Mutex<ThresholdWindow>,
+}
+
+struct ThresholdWindow {
+    start: Instant,
+    count: u64,
+    threshold: Option<u64>,
 }
 
 impl Plugin for PurgePlugin {
@@ -116,17 +129,20 @@ impl Plugin for PurgePlugin {
             },
         );
 
-        match result {
-            Ok(()) => Some(json_response(StatusCode::OK, r#"{"message":"success"}"#)),
+        let exceeded = self.bump_threshold();
+        let resp = match result {
+            Ok(()) => json_response(StatusCode::OK, r#"{"message":"success"}"#),
             Err(err) => {
                 if err.to_string().contains("key not found") {
-                    Some(empty_response(StatusCode::NOT_FOUND))
+                    empty_response(StatusCode::NOT_FOUND)
                 } else {
                     warn!("purge {} failed: {err}", store_url);
-                    Some(empty_response(StatusCode::INTERNAL_SERVER_ERROR))
+                    empty_response(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             }
-        }
+        };
+        self.log_purge(resp.status(), &store_url, is_dir, exceeded);
+        Some(resp)
     }
 }
 
@@ -137,7 +153,31 @@ pub fn register() {
 fn new_purge_plugin(cfg: &config::Plugin) -> Result<std::sync::Arc<dyn Plugin>> {
     let options = decode_options(cfg)?;
     let allow_hosts = options.allow_hosts.iter().cloned().collect::<HashSet<_>>();
-    Ok(std::sync::Arc::new(PurgePlugin { options, allow_hosts }))
+    let log_writer = options
+        .log_path
+        .as_ref()
+        .and_then(|path| {
+            if path.trim().is_empty() {
+                return None;
+            }
+            let path = Path::new(path);
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            OpenOptions::new().create(true).append(true).open(path).ok()
+        })
+        .map(Mutex::new);
+    let threshold_window = ThresholdWindow {
+        start: Instant::now(),
+        count: 0,
+        threshold: options.threshold.and_then(|v| if v > 0 { Some(v as u64) } else { None }),
+    };
+    Ok(std::sync::Arc::new(PurgePlugin {
+        options,
+        allow_hosts,
+        log_writer,
+        threshold_window: Mutex::new(threshold_window),
+    }))
 }
 
 fn decode_options(cfg: &config::Plugin) -> Result<PurgeOptions> {
@@ -167,4 +207,36 @@ fn json_response(status: StatusCode, payload: &str) -> Response<Full<Bytes>> {
         .header("Content-Length", payload.len().to_string())
         .body(Full::new(Bytes::from(payload.to_string())))
         .unwrap()
+}
+
+impl PurgePlugin {
+    fn bump_threshold(&self) -> bool {
+        let mut window = match self.threshold_window.lock() {
+            Ok(win) => win,
+            Err(_) => return false,
+        };
+        let Some(threshold) = window.threshold else { return false };
+        if window.start.elapsed() > Duration::from_secs(60) {
+            window.start = Instant::now();
+            window.count = 0;
+        }
+        window.count += 1;
+        window.count > threshold
+    }
+
+    fn log_purge(&self, status: StatusCode, url: &str, dir: bool, exceeded: bool) {
+        let Some(writer) = &self.log_writer else { return };
+        let stamp = storage::unix_now();
+        let line = format!(
+            "{} status={} dir={} exceeded={} url={}\n",
+            stamp,
+            status.as_u16(),
+            dir,
+            exceeded,
+            url
+        );
+        if let Ok(mut writer) = writer.lock() {
+            let _ = writer.write_all(line.as_bytes());
+        }
+    }
 }

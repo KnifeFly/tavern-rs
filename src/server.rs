@@ -2,13 +2,15 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::{env, io::Write};
+use std::io::Read;
 
 use base64::Engine;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::Full;
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
@@ -16,6 +18,9 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::time::Duration;
 use pprof::protos::Message;
+use chrono::Local;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use tokio::sync::watch;
 
 use crate::cache::CacheStore;
 use crate::config::{Bootstrap, MiddlewareConfig};
@@ -58,14 +63,19 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     let cache_completed_pub = event::new_publisher(&event::new_topic_key::<CacheCompletedPayload>(
         event::CACHE_COMPLETED_KEY,
     ));
-    let proxy = Arc::new(proxy::ReverseProxy::new(build_upstream_nodes(&cfg)));
+    let proxy_policy = proxy::BalancePolicy::from_str(&cfg.upstream.balancing);
+    let proxy = Arc::new(proxy::ReverseProxy::new(build_upstream_nodes(&cfg), proxy_policy));
     let access_logger = build_access_logger(&cfg);
     let pprof_auth = cfg
         .server
         .pprof
         .as_ref()
         .map(|p| (p.username.clone(), p.password.clone()));
-    let cache = Arc::new(CacheStore::new());
+    let cache = if cache_cfg.object_pool_enabled {
+        Arc::new(CacheStore::new_with_limit(cache_cfg.object_pool_size))
+    } else {
+        Arc::new(CacheStore::new())
+    };
     let upstream = UpstreamClient::new();
     let cache_completed_pub: Arc<dyn Fn(&EventContext, CacheCompletedPayload) + Send + Sync> =
         Arc::new(cache_completed_pub);
@@ -97,12 +107,24 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     });
 
     let addr = state.cfg.server.addr.clone();
-
-    if is_unix_addr(&addr) {
-        run_unix(&addr, state).await
-    } else {
-        run_tcp(&addr, state).await
+    let inherited = inherited_listener(&addr);
+    let (listener, meta) = bind_listener(&addr, inherited)?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    spawn_signal_handlers(meta, Arc::clone(&state.cfg), shutdown_tx);
+    notify_ready();
+    let result = match listener {
+        ListenerKind::Tcp(listener) => run_tcp(listener, shutdown_rx, Arc::clone(&state)).await,
+        ListenerKind::Unix { listener, .. } => run_unix(listener, shutdown_rx, Arc::clone(&state)).await,
+    };
+    if let Err(err) = result {
+        return Err(err);
     }
+    for plugin in &state.plugins {
+        if let Err(err) = plugin.stop() {
+            log::warn!("plugin {} stop failed: {err}", plugin.name());
+        }
+    }
+    Ok(())
 }
 
 struct AppState {
@@ -124,11 +146,15 @@ struct AppState {
 struct CacheConfig {
     include_query: bool,
     chunk_size: u64,
+    object_pool_enabled: bool,
+    object_pool_size: Option<usize>,
 }
 
 fn build_cache_config(cfg: &Bootstrap) -> CacheConfig {
     let mut include_query = true;
     let mut chunk_size = cfg.storage.slice_size;
+    let mut object_pool_enabled = false;
+    let mut object_pool_size = None;
     if chunk_size == 0 {
         chunk_size = DEFAULT_CHUNK_SIZE;
     }
@@ -140,11 +166,21 @@ fn build_cache_config(cfg: &Bootstrap) -> CacheConfig {
         if let Some(val) = opts.slice_size {
             chunk_size = val;
         }
+        if let Some(enabled) = opts.object_pool_enabled {
+            object_pool_enabled = enabled;
+        }
+        if let Some(size) = opts.object_pool_size {
+            if size > 0 {
+                object_pool_size = Some(size as usize);
+            }
+        }
     }
 
     CacheConfig {
         include_query,
         chunk_size,
+        object_pool_enabled,
+        object_pool_size,
     }
 }
 
@@ -187,6 +223,10 @@ struct CachingOptions {
     include_query_in_cache_key: Option<bool>,
     #[serde(default)]
     slice_size: Option<u64>,
+    #[serde(default)]
+    object_pool_enabled: Option<bool>,
+    #[serde(default, rename = "object_pool_size", alias = "object_poll_size")]
+    object_pool_size: Option<u64>,
 }
 
 fn find_caching_options(middlewares: &[MiddlewareConfig]) -> Option<CachingOptions> {
@@ -196,6 +236,8 @@ fn find_caching_options(middlewares: &[MiddlewareConfig]) -> Option<CachingOptio
                 return Some(CachingOptions {
                     include_query_in_cache_key: None,
                     slice_size: None,
+                    object_pool_enabled: None,
+                    object_pool_size: None,
                 });
             }
             let val = serde_yaml::to_value(&mw.options).ok()?;
@@ -341,70 +383,262 @@ fn is_unix_addr(addr: &str) -> bool {
     addr.starts_with("unix://") || addr.ends_with(".sock") || addr.starts_with('/')
 }
 
-async fn run_tcp(addr: &str, state: Arc<AppState>) -> Result<()> {
+enum ListenerKind {
+    Tcp(TcpListener),
+    Unix { listener: UnixListener, path: String },
+}
+
+struct ListenerMeta {
+    fd: RawFd,
+    kind: &'static str,
+    addr: String,
+}
+
+fn inherited_listener(addr: &str) -> Option<ListenerMeta> {
+    let fd = env::var("TAVERN_GRACEFUL_FD").ok()?.parse::<RawFd>().ok()?;
+    let kind = env::var("TAVERN_GRACEFUL_TYPE")
+        .unwrap_or_else(|_| if is_unix_addr(addr) { "unix".into() } else { "tcp".into() });
+    let addr = env::var("TAVERN_GRACEFUL_ADDR").unwrap_or_else(|_| addr.to_string());
+    let kind = if kind == "unix" { "unix" } else { "tcp" };
+    Some(ListenerMeta { fd, kind, addr })
+}
+
+fn bind_listener(addr: &str, inherited: Option<ListenerMeta>) -> Result<(ListenerKind, ListenerMeta)> {
+    if let Some(mut meta) = inherited {
+        if meta.kind == "unix" {
+            let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(meta.fd) };
+            listener.set_nonblocking(true)?;
+            let tokio_listener = UnixListener::from_std(listener)?;
+            meta.fd = tokio_listener.as_raw_fd();
+            return Ok((
+                ListenerKind::Unix {
+                    listener: tokio_listener,
+                    path: meta.addr.clone(),
+                },
+                meta,
+            ));
+        }
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(meta.fd) };
+        listener.set_nonblocking(true)?;
+        let tokio_listener = TcpListener::from_std(listener)?;
+        meta.fd = tokio_listener.as_raw_fd();
+        return Ok((ListenerKind::Tcp(tokio_listener), meta));
+    }
+
+    if is_unix_addr(addr) {
+        let path = addr.strip_prefix("unix://").unwrap_or(addr);
+        let path_ref = Path::new(path);
+        if path_ref.exists() {
+            std::fs::remove_file(path_ref).ok();
+        }
+        let listener = std::os::unix::net::UnixListener::bind(path_ref).context("bind unix socket")?;
+        listener.set_nonblocking(true)?;
+        let tokio_listener = UnixListener::from_std(listener)?;
+        let meta = ListenerMeta {
+            fd: tokio_listener.as_raw_fd(),
+            kind: "unix",
+            addr: path.to_string(),
+        };
+        return Ok((
+            ListenerKind::Unix {
+                listener: tokio_listener,
+                path: path.to_string(),
+            },
+            meta,
+        ));
+    }
+
     let bind_addr = if addr.starts_with(':') {
         format!("0.0.0.0{}", addr)
     } else {
         addr.to_string()
     };
     let socket_addr: SocketAddr = bind_addr.parse().context("parse server.addr")?;
-    let listener = TcpListener::bind(socket_addr).await.context("bind tcp")?;
-
-    loop {
-        let (stream, _) = listener.accept().await.context("accept tcp")?;
-        let peer = stream.peer_addr().ok().map(|addr| addr.to_string());
-        let io = TokioIo::new(stream);
-        let state = Arc::clone(&state);
-
-        tokio::spawn(async move {
-            let state = Arc::clone(&state);
-            let service = service_fn(move |mut req| {
-                if let Some(peer) = &peer {
-                    req.extensions_mut().insert(RemoteAddr(peer.clone()));
-                }
-                handle(req, Arc::clone(&state))
-            });
-            let builder = ConnBuilder::new(TokioExecutor::new());
-            if let Err(err) = builder.serve_connection(io, service).await {
-                log::error!("http connection error: {err}");
-            }
-        });
-    }
+    let listener = std::net::TcpListener::bind(socket_addr).context("bind tcp")?;
+    listener.set_nonblocking(true)?;
+    let tokio_listener = TcpListener::from_std(listener)?;
+    let meta = ListenerMeta {
+        fd: tokio_listener.as_raw_fd(),
+        kind: "tcp",
+        addr: bind_addr,
+    };
+    Ok((ListenerKind::Tcp(tokio_listener), meta))
 }
 
-async fn run_unix(addr: &str, state: Arc<AppState>) -> Result<()> {
-    let path = addr.strip_prefix("unix://").unwrap_or(addr);
-    let path = Path::new(path);
-    if path.exists() {
-        tokio::fs::remove_file(path).await.ok();
-    }
-
-    let listener = UnixListener::bind(path).context("bind unix socket")?;
-
-    loop {
-        let (stream, _) = listener.accept().await.context("accept unix")?;
-        let io = TokioIo::new(stream);
-        let peer = Some("unix".to_string());
-        let state = Arc::clone(&state);
-
-        tokio::spawn(async move {
-            let state = Arc::clone(&state);
-            let service = service_fn(move |mut req| {
-                if let Some(peer) = &peer {
-                    req.extensions_mut().insert(RemoteAddr(peer.clone()));
+fn spawn_signal_handlers(meta: ListenerMeta, cfg: Arc<Bootstrap>, shutdown: watch::Sender<bool>) {
+    let upgrade_meta = ListenerMeta {
+        fd: meta.fd,
+        kind: meta.kind,
+        addr: meta.addr.clone(),
+    };
+    let shutdown_upgrade = shutdown.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        {
+            while sig.recv().await.is_some() {
+                if let Err(err) = spawn_upgrade(&upgrade_meta, &cfg, shutdown_upgrade.clone()).await {
+                    log::error!("graceful upgrade failed: {err}");
                 }
-                handle(req, Arc::clone(&state))
-            });
-            let builder = ConnBuilder::new(TokioExecutor::new());
-            if let Err(err) = builder.serve_connection(io, service).await {
-                log::error!("http connection error: {err}");
             }
-        });
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+        loop {
+            tokio::select! {
+                _ = async {
+                    if let Some(sig) = sigterm.as_mut() {
+                        let _ = sig.recv().await;
+                    }
+                } => {
+                    let _ = shutdown.send(true);
+                    break;
+                }
+                _ = async {
+                    if let Some(sig) = sigint.as_mut() {
+                        let _ = sig.recv().await;
+                    }
+                } => {
+                    let _ = shutdown.send(true);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn spawn_upgrade(meta: &ListenerMeta, cfg: &Bootstrap, shutdown: watch::Sender<bool>) -> Result<()> {
+    clear_cloexec(meta.fd)?;
+    let (read_fd, write_fd) = nix::unistd::pipe().context("pipe")?;
+    clear_cloexec(write_fd)?;
+    let exe = env::current_exe().context("current exe")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(env::args().skip(1));
+    cmd.env("TAVERN_GRACEFUL_FD", meta.fd.to_string());
+    cmd.env("TAVERN_GRACEFUL_TYPE", meta.kind);
+    cmd.env("TAVERN_GRACEFUL_ADDR", &meta.addr);
+    cmd.env("TAVERN_GRACEFUL_READY_FD", write_fd.to_string());
+    if let Some(pidfile) = &cfg.pidfile {
+        cmd.env("TAVERN_GRACEFUL_PIDFILE", pidfile);
     }
+    cmd.spawn().context("spawn upgrade")?;
+    nix::unistd::close(write_fd).ok();
+    let ready = tokio::time::timeout(Duration::from_secs(30), wait_ready(read_fd)).await;
+    match ready {
+        Ok(Ok(())) => {
+            let _ = shutdown.send(true);
+        }
+        Ok(Err(err)) => {
+            log::warn!("upgrade readiness failed: {err}");
+        }
+        Err(_) => {
+            log::warn!("upgrade readiness timeout");
+        }
+    }
+    Ok(())
+}
+
+async fn wait_ready(fd: RawFd) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut buf = [0u8; 1];
+        file.read_exact(&mut buf).context("read ready")
+    })
+    .await
+    .unwrap_or_else(|err| Err(anyhow!("join error: {err}")))
+}
+
+fn notify_ready() {
+    let fd = match env::var("TAVERN_GRACEFUL_READY_FD") {
+        Ok(val) => val.parse::<RawFd>().ok(),
+        Err(_) => None,
+    };
+    let Some(fd) = fd else { return };
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let _ = file.write_all(b"1");
+}
+
+fn clear_cloexec(fd: RawFd) -> Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    let flags = fcntl(fd, FcntlArg::F_GETFD).context("fcntl getfd")?;
+    let mut flags = FdFlag::from_bits_truncate(flags);
+    flags.remove(FdFlag::FD_CLOEXEC);
+    fcntl(fd, FcntlArg::F_SETFD(flags)).context("fcntl setfd")?;
+    Ok(())
+}
+
+async fn run_tcp(
+    listener: TcpListener,
+    mut shutdown: watch::Receiver<bool>,
+    state: Arc<AppState>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            res = listener.accept() => {
+                let (stream, _) = res.context("accept tcp")?;
+                let peer = stream.peer_addr().ok().map(|addr| addr.to_string());
+                let io = TokioIo::new(stream);
+                let state = Arc::clone(&state);
+
+                tokio::spawn(async move {
+                    let state = Arc::clone(&state);
+                    let service = service_fn(move |mut req| {
+                        if let Some(peer) = &peer {
+                            req.extensions_mut().insert(RemoteAddr(peer.clone()));
+                        }
+                        handle(req, Arc::clone(&state))
+                    });
+                    let builder = ConnBuilder::new(TokioExecutor::new());
+                    if let Err(err) = builder.serve_connection(io, service).await {
+                        metrics::record_unexpected_closed("HTTP/1.1", "UNKNOWN");
+                        log::error!("http connection error: {err}");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_unix(
+    listener: UnixListener,
+    mut shutdown: watch::Receiver<bool>,
+    state: Arc<AppState>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            res = listener.accept() => {
+                let (stream, _) = res.context("accept unix")?;
+                let io = TokioIo::new(stream);
+                let peer = Some("unix".to_string());
+                let state = Arc::clone(&state);
+
+                tokio::spawn(async move {
+                    let state = Arc::clone(&state);
+                    let service = service_fn(move |mut req| {
+                        if let Some(peer) = &peer {
+                            req.extensions_mut().insert(RemoteAddr(peer.clone()));
+                        }
+                        handle(req, Arc::clone(&state))
+                    });
+                    let builder = ConnBuilder::new(TokioExecutor::new());
+                    if let Err(err) = builder.serve_connection(io, service).await {
+                        metrics::record_unexpected_closed("HTTP/1.1", "UNKNOWN");
+                        log::error!("http connection error: {err}");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let request_id = metrics::request_id_from_headers(req.headers());
     let req_info = RequestInfo::from_request(&req);
     let host = extract_host(&req);
     let is_local = host
@@ -413,12 +647,17 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response
         .map(|h| state.local_hosts.contains(h))
         .unwrap_or(false);
 
-    let mut resp = if is_local {
-        handle_internal(req, &state).await
-    } else {
-        handle_proxy(req, Arc::clone(&state)).await
-    };
-    if let Ok(val) = request_id.parse() {
+    let protocol = req_info.protocol.clone();
+    let method = req_info.method.to_string();
+    let mut resp = metrics::with_request_context(protocol, method, async {
+        if is_local {
+            handle_internal(req, &state).await
+        } else {
+            handle_proxy(req, Arc::clone(&state)).await
+        }
+    })
+    .await;
+    if let Ok(val) = req_info.request_id.parse() {
         resp.headers_mut()
             .insert(constants::PROTOCOL_REQUEST_ID_KEY, val);
     }
@@ -514,6 +753,16 @@ struct RequestInfo {
     method: Method,
     uri: String,
     remote_addr: String,
+    client_ip: String,
+    host: String,
+    referer: String,
+    user_agent: String,
+    content_length: String,
+    range: String,
+    x_forwarded_for: String,
+    request_id: String,
+    protocol: String,
+    start_at: std::time::Instant,
 }
 
 impl RequestInfo {
@@ -523,10 +772,58 @@ impl RequestInfo {
             .get::<RemoteAddr>()
             .map(|v| v.0.clone())
             .unwrap_or_else(|| "-".to_string());
+        let client_ip = client_ip(&remote_addr, req.headers());
+        let host = extract_host(req).unwrap_or_else(|| "-".to_string());
+        let host = host.split(':').next().unwrap_or(&host).to_string();
+        let referer = req
+            .headers()
+            .get("Referer")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let user_agent = req
+            .headers()
+            .get("User-Agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let content_length = req
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let range = req
+            .headers()
+            .get("Range")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let x_forwarded_for = req
+            .headers()
+            .get("X-Forwarded-For")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let request_id = metrics::request_id_from_headers(req.headers());
+        let protocol = format!("{:?}", req.version())
+            .replace("HTTP/", "HTTP/")
+            .replace("_", ".")
+            .replace("HTTP.", "HTTP/");
         Self {
             method: req.method().clone(),
             uri: req.uri().to_string(),
             remote_addr,
+            client_ip,
+            host,
+            referer,
+            user_agent,
+            content_length,
+            range,
+            x_forwarded_for,
+            request_id,
+            protocol,
+            start_at: std::time::Instant::now(),
         }
     }
 }
@@ -598,22 +895,81 @@ fn log_access(state: &AppState, req: &RequestInfo, resp: &Response<Full<Bytes>>)
         None => return,
     };
     let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let cache_status = resp
         .headers()
         .get(constants::PROTOCOL_CACHE_STATUS_KEY)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
-    let request_id = resp
-        .headers()
-        .get(constants::PROTOCOL_REQUEST_ID_KEY)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
-    let ts = storage::unix_now();
-    let line = format!(
-        "{ts} {} {} {} {} {} {}\n",
-        req.remote_addr, req.method, req.uri, status, cache_status, request_id
-    );
+    let body_len = resp.body().size_hint().exact().unwrap_or(0);
+    let bytes_sent = response_header_size(resp.status(), resp.headers()) + body_len;
+    let duration_ms = req.start_at.elapsed().as_millis().to_string();
+    let request_line = format!("{} {} {}", req.method, req.uri, req.protocol);
+    let fields = [
+        normalize_field(&req.client_ip),
+        normalize_field(&req.host),
+        normalize_field_replace(content_type),
+        normalize_field(&format_access_time()),
+        normalize_field_replace(&request_line),
+        normalize_field(&status.to_string()),
+        normalize_field(&bytes_sent.to_string()),
+        normalize_field_replace(&req.referer),
+        normalize_field_replace(&req.user_agent),
+        normalize_field(&duration_ms),
+        normalize_field(&body_len.to_string()),
+        normalize_field_replace(&req.content_length),
+        normalize_field_replace(&req.range),
+        normalize_field_replace(&req.x_forwarded_for),
+        normalize_field(cache_status),
+        normalize_field(&req.request_id),
+    ];
+    let line = format!("{}\n", fields.join(" "));
     logger.log_line(&line);
+}
+
+fn normalize_field(s: &str) -> String {
+    if s.is_empty() {
+        "-".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn normalize_field_replace(s: &str) -> String {
+    if s.is_empty() {
+        "-".to_string()
+    } else {
+        s.replace(' ', "+")
+    }
+}
+
+fn format_access_time() -> String {
+    Local::now().format("[%d/%b/%Y:%H:%M:%S %z]").to_string()
+}
+
+fn response_header_size(status: StatusCode, headers: &HeaderMap) -> u64 {
+    let reason_len = status.canonical_reason().map(|r| r.len()).unwrap_or(0);
+    let mut n = (reason_len + 15) as u64;
+    for (k, v) in headers.iter() {
+        n += (k.as_str().len() + 4) as u64;
+        if let Ok(val) = v.to_str() {
+            n += val.len() as u64;
+        }
+    }
+    n + 2
+}
+
+fn client_ip(remote_addr: &str, headers: &HeaderMap) -> String {
+    let direct = headers
+        .get("Client-Ip")
+        .or_else(|| headers.get("X-Real-IP"))
+        .or_else(|| headers.get("X-Forwarded-For"))
+        .and_then(|v| v.to_str().ok());
+    direct.unwrap_or(remote_addr).to_string()
 }
 
 async fn handle_pprof(req: &Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {

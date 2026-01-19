@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -10,6 +10,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
+use rand::Rng;
 
 pub mod singleflight;
 
@@ -22,6 +23,7 @@ pub struct Node {
 
 impl Node {
     pub fn new(scheme: &str, address: &str, weight: usize) -> Self {
+        let weight = weight.max(1);
         Self {
             scheme: scheme.to_string(),
             address: address.to_string(),
@@ -30,24 +32,49 @@ impl Node {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum BalancePolicy {
+    RoundRobin,
+    Random,
+    WeightedRoundRobin,
+}
+
+impl BalancePolicy {
+    pub fn from_str(raw: &str) -> Self {
+        match raw.to_ascii_lowercase().as_str() {
+            "random" => BalancePolicy::Random,
+            "wrr" | "weighted" | "weighted_round_robin" => BalancePolicy::WeightedRoundRobin,
+            _ => BalancePolicy::RoundRobin,
+        }
+    }
+}
+
 pub struct ReverseProxy {
     nodes: Arc<Vec<Node>>,
     cursor: AtomicUsize,
     clients: Arc<tokio::sync::Mutex<HashMap<String, Client<HttpConnector, Full<Bytes>>>>>,
+    policy: BalancePolicy,
+    wrr_state: Mutex<WrrState>,
 }
 
 impl ReverseProxy {
-    pub fn new(nodes: Vec<Node>) -> Self {
+    pub fn new(nodes: Vec<Node>, policy: BalancePolicy) -> Self {
+        let wrr_state = WrrState::new(&nodes);
         Self {
             nodes: Arc::new(nodes),
             cursor: AtomicUsize::new(0),
             clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            policy,
+            wrr_state: Mutex::new(wrr_state),
         }
     }
 
     pub fn apply(&mut self, nodes: Vec<Node>) {
         self.nodes = Arc::new(nodes);
         self.cursor.store(0, Ordering::SeqCst);
+        if let Ok(mut state) = self.wrr_state.lock() {
+            *state = WrrState::new(&self.nodes);
+        }
     }
 
     pub async fn do_request(
@@ -88,8 +115,35 @@ impl ReverseProxy {
         if nodes.is_empty() {
             return None;
         }
-        let idx = self.cursor.fetch_add(1, Ordering::SeqCst) % nodes.len();
-        Some(nodes[idx].clone())
+        match self.policy {
+            BalancePolicy::Random => {
+                let idx = rand::thread_rng().gen_range(0..nodes.len());
+                Some(nodes[idx].clone())
+            }
+            BalancePolicy::WeightedRoundRobin => {
+                let mut state = self.wrr_state.lock().ok()?;
+                if state.current.len() != nodes.len() {
+                    *state = WrrState::new(nodes);
+                }
+                let mut best = 0usize;
+                for (idx, node) in nodes.iter().enumerate() {
+                    state.current[idx] += node.weight as i32;
+                    if state.current[idx] > state.current[best] {
+                        best = idx;
+                    }
+                }
+                if state.total == 0 {
+                    let idx = self.cursor.fetch_add(1, Ordering::SeqCst) % nodes.len();
+                    return Some(nodes[idx].clone());
+                }
+                state.current[best] -= state.total;
+                Some(nodes[best].clone())
+            }
+            BalancePolicy::RoundRobin => {
+                let idx = self.cursor.fetch_add(1, Ordering::SeqCst) % nodes.len();
+                Some(nodes[idx].clone())
+            }
+        }
     }
 
     pub fn next_node(&self) -> Option<Node> {
@@ -105,6 +159,22 @@ impl ReverseProxy {
         let client = Client::builder(TokioExecutor::new()).build(connector);
         map.insert(addr.to_string(), client.clone());
         client
+    }
+}
+
+#[derive(Debug)]
+struct WrrState {
+    current: Vec<i32>,
+    total: i32,
+}
+
+impl WrrState {
+    fn new(nodes: &[Node]) -> Self {
+        let total = nodes.iter().map(|n| n.weight as i32).sum();
+        Self {
+            current: vec![0; nodes.len()],
+            total,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -89,7 +89,7 @@ struct CachingOptions {
     fill_range_percent: Option<u64>,
     #[serde(default)]
     object_pool_enabled: Option<bool>,
-    #[serde(default)]
+    #[serde(default, alias = "object_poll_size")]
     object_pool_size: Option<usize>,
     #[serde(default)]
     async_flush_chunk: Option<bool>,
@@ -264,30 +264,11 @@ async fn handle_request(
         resolve_cache_entry(&req, &state, &cfg, base_key.clone()).await?;
 
     if let Some(entry) = entry_opt {
-        if entry.is_expired() {
-            if cfg.fuzzy_refresh && cfg.fuzzy_rate > 0.0 {
-                let roll: f64 = rand::thread_rng().gen();
-                if roll < cfg.fuzzy_rate {
-                    let state_cloned = Arc::clone(&state);
-                    let cfg_cloned = cfg.clone();
-                    let snapshot = snapshot_request(&req);
-                    let cache_key_cloned = cache_key.clone();
-                    tokio::spawn(async move {
-                        let _ =
-                            refresh_entry(snapshot, state_cloned, &cfg_cloned, &cache_key_cloned)
-                                .await;
-                    });
-                    return Ok(serve_cached_with_status(
-                        &req,
-                        entry,
-                        CacheStatus::RevalidateHit,
-                        range_header,
-                    ));
-                }
-            }
-            return Ok(handle_revalidate(&req, &state, &cfg, &cache_key, entry, range_header).await);
+        if !entry.is_expired() {
+            maybe_trigger_fuzzy_refresh(&req, &state, &cfg, &cache_key, &entry);
+            return Ok(handle_cache_hit(&req, &state, &cfg, &cache_key, entry, range_header).await);
         }
-        return Ok(handle_cache_hit(&req, &state, &cfg, &cache_key, entry, range_header).await);
+        return Ok(handle_revalidate(&req, &state, &cfg, &cache_key, entry, range_header).await);
     }
 
     if let Some(resp) = handle_storage_hit(&req, &state, &cache_key, range_header).await {
@@ -639,12 +620,14 @@ fn build_cache_entry(
     chunk_hint: Option<&[u32]>,
 ) -> CacheEntry {
     let size = size_override.unwrap_or(body.len() as u64);
+    let created_at = Instant::now();
     let mut entry = CacheEntry {
         headers: response_headers.clone(),
         status,
         body: body.clone(),
         size,
-        expires_at: cache_expiry(ttl),
+        created_at,
+        expires_at: cache_expiry_at(created_at, ttl),
         etag: response_headers
             .get("ETag")
             .and_then(|v| v.to_str().ok())
@@ -689,12 +672,14 @@ fn build_vary_index(
     if headers.is_empty() || headers.len() > cfg.vary_limit {
         return None;
     }
+    let created_at = Instant::now();
     let mut index_entry = CacheEntry {
         headers: response_headers.clone(),
         status,
         body: Bytes::new(),
         size: 0,
-        expires_at: cache_expiry(ttl),
+        created_at,
+        expires_at: cache_expiry_at(created_at, ttl),
         etag: None,
         last_modified: None,
         chunk_size: cfg.chunk_size,
@@ -777,6 +762,73 @@ async fn handle_cache_hit(
     }
 
     response_with_headers(resp_status, headers, resp_body)
+}
+
+fn maybe_trigger_fuzzy_refresh(
+    req: &Request<Incoming>,
+    state: &Arc<CachingState>,
+    cfg: &Config,
+    cache_key: &str,
+    entry: &CacheEntry,
+) {
+    if !cfg.fuzzy_refresh || cfg.fuzzy_rate <= 0.0 {
+        return;
+    }
+    let Some((soft_ttl, hard_ttl)) = fuzzy_refresh_window(entry, cfg.fuzzy_rate) else {
+        return;
+    };
+    let now = Instant::now();
+    if !should_trigger_fuzzy_refresh(now, soft_ttl, hard_ttl) {
+        return;
+    }
+    if !entry_complete(entry) {
+        return;
+    }
+    if !entry_has_condition(entry) {
+        return;
+    }
+    let state_cloned = Arc::clone(state);
+    let cfg_cloned = cfg.clone();
+    let snapshot = snapshot_request(req);
+    let cache_key_cloned = cache_key.to_string();
+    tokio::spawn(async move {
+        let _ = refresh_entry(snapshot, state_cloned, &cfg_cloned, &cache_key_cloned).await;
+    });
+}
+
+fn fuzzy_refresh_window(entry: &CacheEntry, rate: f64) -> Option<(Instant, Instant)> {
+    let mut rate = rate;
+    if rate <= 0.0 || rate > 1.0 {
+        rate = 0.8;
+    }
+    let ttl = entry.expires_at.checked_duration_since(entry.created_at)?;
+    if ttl.as_nanos() == 0 {
+        return None;
+    }
+    let soft = entry.created_at + ttl.mul_f64(rate);
+    Some((soft, entry.expires_at))
+}
+
+fn should_trigger_fuzzy_refresh(now: Instant, soft_ttl: Instant, hard_ttl: Instant) -> bool {
+    if now < soft_ttl || now >= hard_ttl {
+        return false;
+    }
+    let total = hard_ttl.duration_since(soft_ttl).as_secs_f64();
+    if total <= 0.0 {
+        return false;
+    }
+    let elapsed = now.duration_since(soft_ttl).as_secs_f64();
+    let probability = elapsed / total;
+    let roll: f64 = rand::thread_rng().gen();
+    roll < probability
+}
+
+fn entry_complete(entry: &CacheEntry) -> bool {
+    entry.size == 0 || entry.body.len() as u64 == entry.size
+}
+
+fn entry_has_condition(entry: &CacheEntry) -> bool {
+    entry.etag.is_some() || entry.last_modified.is_some()
 }
 
 fn serve_storage_range(
@@ -1045,9 +1097,13 @@ async fn handle_revalidate(
             if status == StatusCode::NOT_MODIFIED {
                 let ttl = cache_ttl(&headers).or_else(|| cache_ttl(&entry.headers));
                 if let Some(ttl) = ttl {
+                    let now = Instant::now();
                     state
                         .cache
-                        .update(cache_key, |e| e.expires_at = cache_expiry(Some(ttl)))
+                        .update(cache_key, |e| {
+                            e.created_at = now;
+                            e.expires_at = cache_expiry_at(now, Some(ttl));
+                        })
                         .await;
                 }
                 return serve_cached_with_status(
@@ -1496,13 +1552,14 @@ fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
     None
 }
 
-fn cache_expiry(ttl: Option<Duration>) -> std::time::Instant {
+fn cache_expiry_at(now: Instant, ttl: Option<Duration>) -> Instant {
     if let Some(ttl) = ttl {
-        std::time::Instant::now() + ttl
+        now + ttl
     } else {
-        std::time::Instant::now()
+        now
     }
 }
+
 
 fn is_cacheable(status: StatusCode, headers: &HeaderMap, ttl: Option<Duration>) -> bool {
     if ttl.is_none() {
