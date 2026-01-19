@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 
 use crate::config;
 use crate::storage::bucket::{disk::DiskBucket, empty::EmptyBucket, memory::MemoryBucket};
+use crate::storage::bucket::lru::EvictionPolicy;
 use crate::storage::indexdb;
 use crate::storage::object::Id;
 use crate::storage::selector::{HashRingSelector, RoundRobinSelector};
@@ -26,10 +27,16 @@ impl NativeStorage {
         let _ = shared_kv.drop_prefix(b"ix/");
         let mut buckets: Vec<Arc<dyn crate::storage::Bucket>> = Vec::new();
         let mut bucket_by_id = HashMap::new();
+        let policy = parse_eviction_policy(&cfg.eviction_policy);
 
         if cfg.buckets.is_empty() {
-            let bucket: Arc<dyn Bucket> =
-                MemoryBucket::new("memory", Arc::clone(&shared_kv), default_max_objects());
+            let bucket: Arc<dyn Bucket> = MemoryBucket::new(
+                "memory",
+                Arc::clone(&shared_kv),
+                default_max_objects(),
+                policy,
+                "memory".to_string(),
+            );
             bucket_by_id.insert(bucket.id().to_string(), Arc::clone(&bucket));
             buckets.push(bucket);
         } else {
@@ -40,15 +47,30 @@ impl NativeStorage {
                     bucket_cfg.db_type.as_str()
                 };
                 let max_objects = normalize_max_objects(bucket_cfg.max_object_limit);
+                let store_type = if bucket_cfg.bucket_type.trim().is_empty() {
+                    "normal".to_string()
+                } else {
+                    bucket_cfg.bucket_type.clone()
+                };
                 let async_load = bucket_cfg.async_load || cfg.async_load;
-                let bucket: Arc<dyn Bucket> = match bucket_cfg.driver.as_str() {
-                    "memory" | "mem" => MemoryBucket::new(
+                let driver = if bucket_cfg.driver.trim().is_empty() {
+                    cfg.driver.as_str()
+                } else {
+                    bucket_cfg.driver.as_str()
+                };
+                let bucket: Arc<dyn Bucket> = match driver {
+                    "memory" | "mem" | "fastmemory" => MemoryBucket::new(
                         &format!("memory-{idx}"),
                         Arc::clone(&shared_kv),
                         max_objects,
+                        policy,
+                        store_type,
                     ),
                     "empty" => EmptyBucket::new(&format!("empty-{idx}")),
                     _ => {
+                        if driver == "custom-driver" {
+                            log::warn!("custom-driver not supported, fallback to native disk bucket");
+                        }
                         let path = if bucket_cfg.path.is_empty() {
                             PathBuf::from(format!("bucket-{idx}"))
                         } else {
@@ -71,6 +93,8 @@ impl NativeStorage {
                             Arc::clone(&shared_kv),
                             async_load,
                             max_objects,
+                            policy,
+                            store_type,
                         )?
                     }
                 };
@@ -191,6 +215,14 @@ fn normalize_max_objects(limit: i64) -> Option<usize> {
         default_max_objects()
     } else {
         Some(limit as usize)
+    }
+}
+
+fn parse_eviction_policy(raw: &str) -> EvictionPolicy {
+    match raw.to_ascii_lowercase().as_str() {
+        "fifo" => EvictionPolicy::Fifo,
+        "lfu" => EvictionPolicy::Lfu,
+        _ => EvictionPolicy::Lru,
     }
 }
 

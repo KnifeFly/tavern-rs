@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod net;
 pub mod plugin;
 pub mod proxy;
+pub mod push;
 pub mod runtime;
 pub mod server;
 pub mod storage;

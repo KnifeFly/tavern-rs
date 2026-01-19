@@ -6,7 +6,7 @@ use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 
-use crate::storage::bucket::lru::LruTracker;
+use crate::storage::bucket::lru::{EvictionPolicy, EvictionTracker};
 use crate::storage::indexdb::IndexDB;
 use crate::storage::object::{Id, IdHash, Metadata};
 use crate::storage::{BoxedReader, BoxedWriter, Bucket, SharedKV};
@@ -19,7 +19,8 @@ pub struct DiskBucket {
     path: PathBuf,
     indexdb: Arc<dyn IndexDB>,
     shared_kv: Arc<dyn SharedKV>,
-    lru: Mutex<LruTracker>,
+    eviction: Mutex<EvictionTracker>,
+    store_type: String,
 }
 
 impl DiskBucket {
@@ -30,6 +31,8 @@ impl DiskBucket {
         shared_kv: Arc<dyn SharedKV>,
         async_load: bool,
         max_objects: Option<usize>,
+        policy: EvictionPolicy,
+        store_type: String,
     ) -> Result<Arc<Self>> {
         fs::create_dir_all(&path)?;
         let bucket = Arc::new(Self {
@@ -39,7 +42,8 @@ impl DiskBucket {
             path,
             indexdb,
             shared_kv,
-            lru: Mutex::new(LruTracker::new(max_objects)),
+            eviction: Mutex::new(EvictionTracker::new(policy, max_objects)),
+            store_type,
         });
         let bucket_clone = Arc::clone(&bucket);
         if async_load {
@@ -53,15 +57,15 @@ impl DiskBucket {
     fn load_metadata(&self) {
         let _ = self.indexdb.iterate(None, &mut |_, meta| {
             {
-                let mut lru = self.lru.lock().expect("lru");
-                lru.touch_no_evict(meta.id.hash());
+                let mut eviction = self.eviction.lock().expect("eviction");
+                eviction.touch_no_evict(meta.id.hash());
             }
             self.update_shared_kv(meta);
             true
         });
         let evicted = {
-            let mut lru = self.lru.lock().expect("lru");
-            lru.evict_overflow()
+            let mut eviction = self.eviction.lock().expect("eviction");
+            eviction.evict_overflow()
         };
         for hash in evicted {
             let _ = self.evict_hash(hash);
@@ -92,8 +96,8 @@ impl DiskBucket {
 
     fn touch_and_evict(&self, hash: IdHash) -> Result<()> {
         let evicted = {
-            let mut lru = self.lru.lock().expect("lru");
-            lru.touch(hash)
+            let mut eviction = self.eviction.lock().expect("eviction");
+            eviction.touch(hash)
         };
         for hash in evicted {
             let _ = self.evict_hash(hash);
@@ -110,8 +114,8 @@ impl DiskBucket {
     }
 
     fn remove_from_lru(&self, hash: IdHash) {
-        let mut lru = self.lru.lock().expect("lru");
-        lru.remove(&hash);
+        let mut eviction = self.eviction.lock().expect("eviction");
+        eviction.remove(&hash);
     }
 }
 
@@ -145,7 +149,7 @@ impl Bucket for DiskBucket {
     }
 
     fn store_type(&self) -> &str {
-        "normal"
+        &self.store_type
     }
 
     fn path(&self) -> &Path {

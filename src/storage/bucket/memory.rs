@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 
-use crate::storage::bucket::lru::LruTracker;
+use crate::storage::bucket::lru::{EvictionPolicy, EvictionTracker};
 use crate::storage::indexdb::{IndexDB, SledIndexDB};
 use crate::storage::object::{Id, IdHash, Metadata};
 use crate::storage::{BoxedReader, BoxedWriter, Bucket, SharedKV};
@@ -17,12 +17,19 @@ pub struct MemoryBucket {
     path: PathBuf,
     indexdb: Arc<dyn IndexDB>,
     shared_kv: Arc<dyn SharedKV>,
-    lru: Mutex<LruTracker>,
+    eviction: Mutex<EvictionTracker>,
+    store_type: String,
     chunks: Arc<Mutex<HashMap<(IdHash, u32), Vec<u8>>>>,
 }
 
 impl MemoryBucket {
-    pub fn new(id: &str, shared_kv: Arc<dyn SharedKV>, max_objects: Option<usize>) -> Arc<Self> {
+    pub fn new(
+        id: &str,
+        shared_kv: Arc<dyn SharedKV>,
+        max_objects: Option<usize>,
+        policy: EvictionPolicy,
+        store_type: String,
+    ) -> Arc<Self> {
         let indexdb = SledIndexDB::temporary().expect("indexdb");
         Arc::new(Self {
             id: id.to_string(),
@@ -31,7 +38,8 @@ impl MemoryBucket {
             path: PathBuf::from("/"),
             indexdb,
             shared_kv,
-            lru: Mutex::new(LruTracker::new(max_objects)),
+            eviction: Mutex::new(EvictionTracker::new(policy, max_objects)),
+            store_type,
             chunks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -41,6 +49,8 @@ impl MemoryBucket {
         indexdb: Arc<dyn IndexDB>,
         shared_kv: Arc<dyn SharedKV>,
         max_objects: Option<usize>,
+        policy: EvictionPolicy,
+        store_type: String,
     ) -> Arc<Self> {
         Arc::new(Self {
             id: id.to_string(),
@@ -49,7 +59,8 @@ impl MemoryBucket {
             path: PathBuf::from("/"),
             indexdb,
             shared_kv,
-            lru: Mutex::new(LruTracker::new(max_objects)),
+            eviction: Mutex::new(EvictionTracker::new(policy, max_objects)),
+            store_type,
             chunks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -67,8 +78,8 @@ impl MemoryBucket {
 
     fn touch_and_evict(&self, hash: IdHash) -> Result<()> {
         let evicted = {
-            let mut lru = self.lru.lock().expect("lru");
-            lru.touch(hash)
+            let mut eviction = self.eviction.lock().expect("eviction");
+            eviction.touch(hash)
         };
         for hash in evicted {
             let _ = self.evict_hash(hash);
@@ -85,8 +96,8 @@ impl MemoryBucket {
     }
 
     fn remove_from_lru(&self, hash: IdHash) {
-        let mut lru = self.lru.lock().expect("lru");
-        lru.remove(&hash);
+        let mut eviction = self.eviction.lock().expect("eviction");
+        eviction.remove(&hash);
     }
 }
 
@@ -120,7 +131,7 @@ impl Bucket for MemoryBucket {
     }
 
     fn store_type(&self) -> &str {
-        "memory"
+        &self.store_type
     }
 
     fn path(&self) -> &Path {

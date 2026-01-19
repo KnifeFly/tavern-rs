@@ -9,13 +9,15 @@ use base64::Engine;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use hyper_util::rt::TokioTimer;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tokio::net::{TcpListener, UnixListener};
+use tokio::net::lookup_host;
 use tokio::time::Duration;
 use pprof::protos::Message;
 use chrono::Local;
@@ -25,12 +27,14 @@ use tokio::sync::watch;
 use crate::cache::CacheStore;
 use crate::config::{Bootstrap, MiddlewareConfig};
 use crate::constants;
-use crate::access_log::AccessLogger;
+use crate::access_log::{AccessEncryptor, AccessLogger};
+use crate::logging;
 use crate::event::{self, CacheCompletedPayload, EventContext};
 use crate::middleware::{self, RoundTripper};
 use crate::middleware::caching::CachingState;
 use crate::metrics;
 use crate::plugin::{Plugin, Router};
+use crate::push;
 use crate::proxy::{self, Node};
 use crate::runtime;
 use crate::storage;
@@ -64,7 +68,7 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
         event::CACHE_COMPLETED_KEY,
     ));
     let proxy_policy = proxy::BalancePolicy::from_str(&cfg.upstream.balancing);
-    let proxy = Arc::new(proxy::ReverseProxy::new(build_upstream_nodes(&cfg), proxy_policy));
+    let proxy = Arc::new(proxy::ReverseProxy::new(build_upstream_nodes(&cfg).await, proxy_policy));
     let access_logger = build_access_logger(&cfg);
     let pprof_auth = cfg
         .server
@@ -76,7 +80,7 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     } else {
         Arc::new(CacheStore::new())
     };
-    let upstream = UpstreamClient::new();
+    let upstream = UpstreamClient::new(&cfg.upstream);
     let cache_completed_pub: Arc<dyn Fn(&EventContext, CacheCompletedPayload) + Send + Sync> =
         Arc::new(cache_completed_pub);
     let cache_state = CachingState::new(
@@ -104,6 +108,7 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
         access_logger,
         pprof_auth,
         proxy_chain,
+        cache_state,
     });
 
     let addr = state.cfg.server.addr.clone();
@@ -127,7 +132,7 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     Ok(())
 }
 
-struct AppState {
+pub(crate) struct AppState {
     cfg: Arc<Bootstrap>,
     cache: Arc<CacheStore>,
     upstream: UpstreamClient,
@@ -140,6 +145,7 @@ struct AppState {
     access_logger: Option<Arc<AccessLogger>>,
     pprof_auth: Option<(String, String)>,
     proxy_chain: Arc<dyn RoundTripper>,
+    pub(crate) cache_state: Arc<CachingState>,
 }
 
 #[derive(Clone, Copy)]
@@ -279,7 +285,7 @@ fn build_plugin_router(plugins: &[Arc<dyn Plugin>]) -> Arc<Router> {
     Arc::new(router)
 }
 
-fn build_upstream_nodes(cfg: &Bootstrap) -> Vec<Node> {
+async fn build_upstream_nodes(cfg: &Bootstrap) -> Vec<Node> {
     let mut nodes = Vec::new();
     for addr in &cfg.upstream.address {
         if addr.trim().is_empty() {
@@ -289,14 +295,40 @@ fn build_upstream_nodes(cfg: &Bootstrap) -> Vec<Node> {
             if let Ok(uri) = addr.parse::<http::Uri>() {
                 let scheme = uri.scheme_str().unwrap_or("http");
                 if let Some(authority) = uri.authority() {
-                    nodes.push(Node::new(scheme, authority.as_str(), 1));
+                    if cfg.upstream.resolve_addresses && scheme != "unix" {
+                        nodes.extend(resolve_nodes(scheme, authority.as_str()).await);
+                    } else {
+                        nodes.push(Node::new(scheme, authority.as_str(), 1));
+                    }
                     continue;
                 }
             }
         }
-        nodes.push(Node::new("http", addr, 1));
+        if cfg.upstream.resolve_addresses {
+            nodes.extend(resolve_nodes("http", addr).await);
+        } else {
+            nodes.push(Node::new("http", addr, 1));
+        }
     }
     nodes
+}
+
+async fn resolve_nodes(scheme: &str, authority: &str) -> Vec<Node> {
+    let mut out = Vec::new();
+    let host_port = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+    match lookup_host(host_port).await {
+        Ok(addrs) => {
+            for addr in addrs {
+                out.push(Node::new(scheme, &addr.to_string(), 1));
+            }
+        }
+        Err(_) => out.push(Node::new(scheme, authority, 1)),
+    }
+    out
 }
 
 struct UpstreamRoundTripper {
@@ -370,7 +402,12 @@ fn build_access_logger(cfg: &Bootstrap) -> Option<Arc<AccessLogger>> {
     if !access.enabled {
         return None;
     }
-    match AccessLogger::new(Some(&access.path)) {
+    let encryptor = if access.encrypt.enabled {
+        AccessEncryptor::new(&access.encrypt.secret)
+    } else {
+        None
+    };
+    match AccessLogger::new(Some(&access.path), encryptor) {
         Ok(logger) => Some(Arc::new(logger)),
         Err(err) => {
             log::warn!("failed to init access log: {err}");
@@ -586,14 +623,16 @@ async fn run_tcp(
 
                 tokio::spawn(async move {
                     let state = Arc::clone(&state);
+                    let cfg = Arc::clone(&state.cfg);
                     let service = service_fn(move |mut req| {
                         if let Some(peer) = &peer {
                             req.extensions_mut().insert(RemoteAddr(peer.clone()));
                         }
                         handle(req, Arc::clone(&state))
                     });
-                    let builder = ConnBuilder::new(TokioExecutor::new());
-                    if let Err(err) = builder.serve_connection(io, service).await {
+                    let mut builder = ConnBuilder::new(TokioExecutor::new());
+                    configure_conn_builder(&mut builder, &cfg.server);
+                    if let Err(err) = serve_with_timeout(builder, io, service, &cfg.server).await {
                         metrics::record_unexpected_closed("HTTP/1.1", "UNKNOWN");
                         log::error!("http connection error: {err}");
                     }
@@ -620,14 +659,16 @@ async fn run_unix(
 
                 tokio::spawn(async move {
                     let state = Arc::clone(&state);
+                    let cfg = Arc::clone(&state.cfg);
                     let service = service_fn(move |mut req| {
                         if let Some(peer) = &peer {
                             req.extensions_mut().insert(RemoteAddr(peer.clone()));
                         }
                         handle(req, Arc::clone(&state))
                     });
-                    let builder = ConnBuilder::new(TokioExecutor::new());
-                    if let Err(err) = builder.serve_connection(io, service).await {
+                    let mut builder = ConnBuilder::new(TokioExecutor::new());
+                    configure_conn_builder(&mut builder, &cfg.server);
+                    if let Err(err) = serve_with_timeout(builder, io, service, &cfg.server).await {
                         metrics::record_unexpected_closed("HTTP/1.1", "UNKNOWN");
                         log::error!("http connection error: {err}");
                     }
@@ -636,6 +677,58 @@ async fn run_unix(
         }
     }
     Ok(())
+}
+
+fn configure_conn_builder(builder: &mut ConnBuilder<TokioExecutor>, cfg: &crate::config::Server) {
+    if cfg.read_header_timeout > Duration::from_secs(0) {
+        builder
+            .http1()
+            .timer(TokioTimer::default())
+            .header_read_timeout(cfg.read_header_timeout);
+    }
+    if cfg.max_header_bytes > 0 {
+        let max_buf = cfg.max_header_bytes.max(8192);
+        builder.http1().max_buf_size(max_buf);
+    }
+    if cfg.idle_timeout == Duration::from_secs(0) {
+        builder.http1().keep_alive(false);
+    }
+}
+
+async fn serve_with_timeout<I, S>(
+    builder: ConnBuilder<TokioExecutor>,
+    io: I,
+    service: S,
+    cfg: &crate::config::Server,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
+    S: hyper::service::Service<Request<Incoming>, Response = Response<Full<Bytes>>> + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if let Some(timeout) = conn_timeout(cfg) {
+        match tokio::time::timeout(timeout, builder.serve_connection(io, service)).await {
+            Ok(res) => res,
+            Err(_) => Ok(()),
+        }
+    } else {
+        builder.serve_connection(io, service).await
+    }
+}
+
+fn conn_timeout(cfg: &crate::config::Server) -> Option<Duration> {
+    let mut candidates = Vec::new();
+    if cfg.read_timeout > Duration::from_secs(0) {
+        candidates.push(cfg.read_timeout);
+    }
+    if cfg.write_timeout > Duration::from_secs(0) {
+        candidates.push(cfg.write_timeout);
+    }
+    if cfg.idle_timeout > Duration::from_secs(0) {
+        candidates.push(cfg.idle_timeout);
+    }
+    candidates.into_iter().min()
 }
 
 async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -649,26 +742,34 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response
 
     let protocol = req_info.protocol.clone();
     let method = req_info.method.to_string();
-    let mut resp = metrics::with_request_context(protocol, method, async {
-        if is_local {
-            handle_internal(req, &state).await
-        } else {
-            handle_proxy(req, Arc::clone(&state)).await
-        }
+    let trace_id = req_info.request_id.clone();
+    let state_for_log = Arc::clone(&state);
+    let mut resp = logging::with_trace_id(trace_id, async move {
+        metrics::with_request_context(protocol, method, async {
+            if is_local {
+                handle_internal(req, &state).await
+            } else {
+                handle_proxy(req, Arc::clone(&state)).await
+            }
+        })
+        .await
     })
     .await;
     if let Ok(val) = req_info.request_id.parse() {
         resp.headers_mut()
             .insert(constants::PROTOCOL_REQUEST_ID_KEY, val);
     }
-    log_access(&state, &req_info, &resp);
+    log_access(&state_for_log, &req_info, &resp);
     Ok(resp)
 }
 
 async fn handle_internal(req: Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
     let path = req.uri().path().to_string();
     if path.starts_with("/debug/pprof") {
-        return handle_pprof(&req, state).await;
+        return handle_pprof(req, state).await;
+    }
+    if path == "/cache/push" {
+        return push::handle(req, state).await;
     }
     if let Some(resp) = state.plugin_router.handle_path(&path, req) {
         return resp;
@@ -972,12 +1073,12 @@ fn client_ip(remote_addr: &str, headers: &HeaderMap) -> String {
     direct.unwrap_or(remote_addr).to_string()
 }
 
-async fn handle_pprof(req: &Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
+async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
     let (user, pass) = match &state.pprof_auth {
         Some(val) => val,
         None => return not_found(),
     };
-    if !basic_auth_ok(req, user, pass) {
+    if !basic_auth_ok(&req, user, pass) {
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("WWW-Authenticate", r#"Basic realm="restricted", charset="UTF-8""#)
@@ -986,12 +1087,23 @@ async fn handle_pprof(req: &Request<Incoming>, state: &AppState) -> Response<Ful
     }
     let path = req.uri().path();
     if path == "/debug/pprof" || path == "/debug/pprof/" {
-        let body = "profile\n";
+        let body = "profile\ncmdline\nsymbol\ntrace\n";
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; charset=utf-8")
             .header("Content-Length", body.len().to_string())
             .body(Full::new(Bytes::from(body)))
+            .unwrap();
+    }
+
+    if path == "/debug/pprof/cmdline" {
+        let mut out = std::env::args().collect::<Vec<_>>().join("\x00");
+        out.push('\x00');
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("Content-Length", out.len().to_string())
+            .body(Full::new(Bytes::from(out)))
             .unwrap();
     }
 
@@ -1051,6 +1163,43 @@ async fn handle_pprof(req: &Request<Incoming>, state: &AppState) -> Response<Ful
             .header("Content-Length", body.len().to_string())
             .body(Full::new(Bytes::from(body)))
             .unwrap();
+    }
+
+    if path == "/debug/pprof/symbol" {
+        let (parts, body) = req.into_parts();
+        let mut input = String::new();
+        if let Ok(data) = body.collect().await {
+            let bytes = data.to_bytes();
+            if !bytes.is_empty() {
+                input = String::from_utf8_lossy(&bytes).to_string();
+            }
+        }
+        if input.trim().is_empty() {
+            if let Some(query) = parts.uri.query() {
+                input = query.to_string();
+            }
+        }
+        let mut out = String::new();
+        let mut count = 0usize;
+        for token in input.split_whitespace() {
+            if token == "?" {
+                continue;
+            }
+            count += 1;
+            out.push_str(token);
+            out.push_str(" unknown\n");
+        }
+        out.push_str(&format!("num symbols: {}\n", count));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("Content-Length", out.len().to_string())
+            .body(Full::new(Bytes::from(out)))
+            .unwrap();
+    }
+
+    if path == "/debug/pprof/trace" {
+        return text_response(StatusCode::NOT_IMPLEMENTED, "trace not supported");
     }
 
     text_response(StatusCode::NOT_FOUND, "pprof endpoint not found")

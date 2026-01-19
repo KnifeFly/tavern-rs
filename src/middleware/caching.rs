@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http::header::HOST;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use rand::Rng;
@@ -762,6 +763,70 @@ async fn handle_cache_hit(
     }
 
     response_with_headers(resp_status, headers, resp_body)
+}
+
+pub(crate) async fn prefetch_url(state: &CachingState, url: &str) -> Result<()> {
+    let uri: http::Uri = url.parse().map_err(|_| anyhow!("invalid url"))?;
+    let cache_key = cache_key_from_uri(&uri, state.include_query)
+        .ok_or_else(|| anyhow!("invalid url"))?;
+    if let Some(entry) = state.cache.get(&cache_key).await {
+        if !entry.is_expired() {
+            return Ok(());
+        }
+    }
+
+    let mut headers = HeaderMap::new();
+    if let Some(authority) = uri.authority() {
+        headers.insert(HOST, authority.as_str().parse().unwrap());
+    }
+    let store_val = http::HeaderValue::from_str(url).map_err(|_| anyhow!("invalid url"))?;
+    headers.insert("X-Store-Url", store_val);
+
+    let snapshot = RequestSnapshot {
+        method: Method::GET,
+        uri: uri.clone(),
+        headers,
+    };
+    let cfg = Config::from_options(state, &CachingOptions::default());
+    let upstream = fetch_upstream_snapshot(&snapshot, state, None, &cfg).await?;
+    if !upstream.ok {
+        return Err(anyhow!("upstream error"));
+    }
+    let ttl = cache_ttl(&upstream.headers);
+    if !is_cacheable(upstream.status, &upstream.headers, ttl) {
+        return Err(anyhow!("response not cacheable"));
+    }
+    let mut response_headers = strip_hop_headers(upstream.headers.clone());
+    response_headers.insert(
+        "Content-Length",
+        upstream.body.len().to_string().parse().unwrap(),
+    );
+    let entry = build_cache_entry(
+        &response_headers,
+        upstream.status,
+        &upstream.body,
+        None,
+        ttl,
+        state.chunk_size,
+        None,
+    );
+    state.cache.insert(cache_key.clone(), entry).await;
+
+    if let Some(payload) = store_to_storage(
+        &cache_key,
+        upstream.status,
+        &upstream.headers,
+        &response_headers,
+        &upstream.body,
+        0,
+        upstream.body.len() as u64,
+        ttl,
+        state.chunk_size,
+        false,
+    ) {
+        (state.cache_completed_pub)(&EventContext, payload);
+    }
+    Ok(())
 }
 
 fn maybe_trigger_fuzzy_refresh(
@@ -1601,6 +1666,17 @@ fn build_cache_key(req: &Request<Incoming>, include_query: bool) -> Option<Strin
         req.uri().path()
     };
     Some(format!("{}://{}{}", scheme, host, path))
+}
+
+fn cache_key_from_uri(uri: &http::Uri, include_query: bool) -> Option<String> {
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let authority = uri.authority()?;
+    let path = if include_query {
+        uri.path_and_query().map(|v| v.as_str()).unwrap_or("/")
+    } else {
+        uri.path()
+    };
+    Some(format!("{}://{}{}", scheme, authority.as_str(), path))
 }
 
 fn select_upstream_addr(req: &Request<Incoming>, state: &CachingState) -> Result<String> {
