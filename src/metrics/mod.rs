@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use http::{HeaderMap, StatusCode};
+use prometheus::{Encoder, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use rand::rngs::OsRng;
 use rand::RngCore;
 
@@ -36,110 +36,169 @@ impl RequestMetric {
     }
 }
 
-#[derive(Default)]
-struct Metrics {
-    requests_total: u64,
-    requests_by_status: HashMap<u16, u64>,
-    requests_code: HashMap<(String, String), u64>,
-    unexpected_closed: HashMap<(String, String), u64>,
-    verifier_requests: HashMap<String, u64>,
-    disk_io: HashMap<(String, String), u64>,
+fn registry() -> &'static Registry {
+    static REGISTRY: OnceLock<Registry> = OnceLock::new();
+    REGISTRY.get_or_init(Registry::new)
 }
 
-fn metrics() -> &'static Mutex<Metrics> {
-    static METRICS: OnceLock<Mutex<Metrics>> = OnceLock::new();
-    METRICS.get_or_init(|| {
-        let mut m = Metrics::default();
-        for code in ["200", "206", "400", "404", "500"] {
-            m.requests_code
-                .insert(("HTTP/1.1".to_string(), code.to_string()), 0);
-        }
-        for method in ["GET", "HEAD"] {
-            m.unexpected_closed
-                .insert(("HTTP/1.1".to_string(), method.to_string()), 0);
-        }
-        for code in ["200", "409", "0"] {
-            m.verifier_requests.insert(code.to_string(), 0);
-        }
-        Mutex::new(m)
+fn requests_total() -> &'static IntCounter {
+    static METRIC: OnceLock<IntCounter> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let counter = IntCounter::new("tavern_requests_total", "Total requests").unwrap();
+        registry().register(Box::new(counter.clone())).unwrap();
+        counter
     })
 }
 
+fn requests_status_total() -> &'static IntCounterVec {
+    static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new("tavern_requests_status_total", "Requests by status"),
+            &["code"],
+        )
+        .unwrap();
+        registry().register(Box::new(counter.clone())).unwrap();
+        counter
+    })
+}
+
+fn requests_code_total() -> &'static IntCounterVec {
+    static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "tr_tavern_requests_code_total",
+                "Total processed requests",
+            ),
+            &["protocol", "code"],
+        )
+        .unwrap();
+        registry().register(Box::new(counter.clone())).unwrap();
+        counter
+    })
+}
+
+fn unexpected_closed_total() -> &'static IntCounterVec {
+    static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "tr_tavern_requests_unexpected_closed_total",
+                "Unexpected closed requests",
+            ),
+            &["protocol", "method"],
+        )
+        .unwrap();
+        registry().register(Box::new(counter.clone())).unwrap();
+        counter
+    })
+}
+
+fn verifier_requests_total() -> &'static IntCounterVec {
+    static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new("tr_tavern_verifier_requests_total", "Verifier requests"),
+            &["code"],
+        )
+        .unwrap();
+        registry().register(Box::new(counter.clone())).unwrap();
+        counter
+    })
+}
+
+fn disk_usage_gauge() -> &'static IntGaugeVec {
+    static METRIC: OnceLock<IntGaugeVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let gauge = IntGaugeVec::new(
+            Opts::new("tr_tavern_disk_usage", "Disk usage"),
+            &["dev", "path"],
+        )
+        .unwrap();
+        registry().register(Box::new(gauge.clone())).unwrap();
+        gauge
+    })
+}
+
+fn disk_io_counter() -> &'static IntCounterVec {
+    static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new("tr_tavern_disk_io", "Disk IO"),
+            &["dev", "path"],
+        )
+        .unwrap();
+        registry().register(Box::new(counter.clone())).unwrap();
+        counter
+    })
+}
+
+fn init_metrics() {
+    let _ = requests_total();
+    let _ = requests_status_total();
+    let _ = disk_usage_gauge();
+    let _ = disk_io_counter();
+    let codes = ["200", "206", "400", "404", "500"];
+    for code in codes {
+        requests_code_total()
+            .with_label_values(&["HTTP/1.1", code])
+            .inc_by(0);
+    }
+    for method in ["GET", "HEAD"] {
+        unexpected_closed_total()
+            .with_label_values(&["HTTP/1.1", method])
+            .inc_by(0);
+    }
+    for code in ["200", "409", "0"] {
+        verifier_requests_total()
+            .with_label_values(&[code])
+            .inc_by(0);
+    }
+}
+
 pub fn record(status: StatusCode) {
-    let mut m = metrics().lock().expect("metrics");
-    m.requests_total += 1;
-    let code = status.as_u16();
-    *m.requests_by_status.entry(code).or_insert(0) += 1;
+    init_metrics();
+    requests_total().inc();
+    let code = status.as_u16().to_string();
+    requests_status_total().with_label_values(&[code.as_str()]).inc();
     let protocol = current_protocol().unwrap_or_else(|| "HTTP/1.1".to_string());
-    let key = (protocol, code.to_string());
-    *m.requests_code.entry(key).or_insert(0) += 1;
+    requests_code_total()
+        .with_label_values(&[protocol.as_str(), code.as_str()])
+        .inc();
 }
 
 pub fn record_unexpected_closed(protocol: &str, method: &str) {
-    let mut m = metrics().lock().expect("metrics");
-    let key = (protocol.to_string(), method.to_string());
-    *m.unexpected_closed.entry(key).or_insert(0) += 1;
+    init_metrics();
+    unexpected_closed_total()
+        .with_label_values(&[protocol, method])
+        .inc();
 }
 
 pub fn record_verifier(code: &str) {
-    let mut m = metrics().lock().expect("metrics");
-    *m.verifier_requests.entry(code.to_string()).or_insert(0) += 1;
+    init_metrics();
+    verifier_requests_total().with_label_values(&[code]).inc();
 }
 
 pub fn record_disk_io(dev: &str, path: &str) {
-    let mut m = metrics().lock().expect("metrics");
-    let key = (dev.to_string(), path.to_string());
-    *m.disk_io.entry(key).or_insert(0) += 1;
+    init_metrics();
+    disk_io_counter()
+        .with_label_values(&[dev, path])
+        .inc();
 }
 
 pub fn render() -> String {
-    let m = metrics().lock().expect("metrics");
-    let mut out = String::new();
-    out.push_str("# TYPE tavern_requests_total counter\n");
-    out.push_str(&format!("tavern_requests_total {}\n", m.requests_total));
-    out.push_str("# TYPE tavern_requests_status_total counter\n");
-    for (code, count) in m.requests_by_status.iter() {
-        out.push_str(&format!(
-            "tavern_requests_status_total{{code=\"{}\"}} {}\n",
-            code, count
-        ));
-    }
-    out.push_str("# TYPE tr_tavern_requests_code_total counter\n");
-    for ((protocol, code), count) in m.requests_code.iter() {
-        out.push_str(&format!(
-            "tr_tavern_requests_code_total{{protocol=\"{}\",code=\"{}\"}} {}\n",
-            protocol, code, count
-        ));
-    }
-    out.push_str("# TYPE tr_tavern_requests_unexpected_closed_total counter\n");
-    for ((protocol, method), count) in m.unexpected_closed.iter() {
-        out.push_str(&format!(
-            "tr_tavern_requests_unexpected_closed_total{{protocol=\"{}\",method=\"{}\"}} {}\n",
-            protocol, method, count
-        ));
-    }
-    out.push_str("# TYPE tr_tavern_verifier_requests_total counter\n");
-    for (code, count) in m.verifier_requests.iter() {
-        out.push_str(&format!(
-            "tr_tavern_verifier_requests_total{{code=\"{}\"}} {}\n",
-            code, count
-        ));
-    }
-    out.push_str("# TYPE tr_tavern_disk_usage gauge\n");
+    init_metrics();
     for metric in disk_usage_metrics() {
-        out.push_str(&format!(
-            "tr_tavern_disk_usage{{dev=\"{}\",path=\"{}\"}} {}\n",
-            metric.dev, metric.path, metric.used_bytes
-        ));
+        disk_usage_gauge()
+            .with_label_values(&[metric.dev.as_str(), metric.path.as_str()])
+            .set(metric.used_bytes as i64);
     }
-    out.push_str("# TYPE tr_tavern_disk_io counter\n");
-    for ((dev, path), count) in m.disk_io.iter() {
-        out.push_str(&format!(
-            "tr_tavern_disk_io{{dev=\"{}\",path=\"{}\"}} {}\n",
-            dev, path, count
-        ));
-    }
-    out
+    let families = registry().gather();
+    let mut buf = Vec::new();
+    let encoder = TextEncoder::new();
+    encoder.encode(&families, &mut buf).unwrap_or(());
+    String::from_utf8(buf).unwrap_or_default()
 }
 
 pub fn request_id_from_headers(headers: &HeaderMap) -> String {

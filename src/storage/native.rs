@@ -10,7 +10,7 @@ use crate::storage::bucket::lru::EvictionPolicy;
 use crate::storage::indexdb;
 use crate::storage::object::Id;
 use crate::storage::selector::{HashRingSelector, RoundRobinSelector};
-use crate::storage::sharedkv::SledSharedKV;
+use crate::storage::sharedkv;
 use crate::storage::{Bucket, PurgeControl, Selector, SharedKV, Storage};
 
 pub struct NativeStorage {
@@ -193,16 +193,12 @@ fn build_shared_kv(cfg: &config::Storage) -> Arc<dyn SharedKV> {
         PathBuf::from(&cfg.db_path)
     };
     let path = base.join("sharedkv");
-    match cfg.db_type.as_str() {
-        "pebble" | "nutsdb" | "sled" => match SledSharedKV::open(&path) {
-            Ok(kv) => kv,
-            Err(err) => {
-                log::warn!("sharedkv open failed: {err}, fallback to memory");
-                crate::storage::MemSharedKV::new()
-            }
-        },
-        "memory" | "mem" | "" => crate::storage::MemSharedKV::new(),
-        _ => crate::storage::MemSharedKV::new(),
+    match sharedkv::open(&path, cfg.db_type.as_str()) {
+        Ok(kv) => kv,
+        Err(err) => {
+            log::warn!("sharedkv open failed: {err}, fallback to memory");
+            crate::storage::MemSharedKV::new()
+        }
     }
 }
 

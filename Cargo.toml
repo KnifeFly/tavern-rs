@@ -13,6 +13,7 @@ crc32fast = "1"
 base64 = "0.22"
 futures = "0.3"
 flexi_logger = { version = "0.28", features = ["compress"] }
+heed = "0.20"
 hex = "0.4"
 http = "1"
 http-body-util = "0.1"
@@ -24,10 +25,13 @@ hyper-rustls = { version = "0.26", features = ["http1", "http2", "native-tokio",
 indexmap = "=2.2.6"
 log = "0.4"
 md5 = "0.7"
+redb = "=2.1.0"
+rocksdb = "0.22"
 rand = "0.8"
 pprof = { version = "0.11", features = ["protobuf-codec"] }
 nix = "0.26"
 rustls = { version = "0.22", default-features = false, features = ["ring", "tls12"] }
+prometheus = "0.13"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 serde_ignored = "0.1"
