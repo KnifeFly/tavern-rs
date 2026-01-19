@@ -905,8 +905,15 @@ fn serve_storage_range(
 ) -> Option<Response<Full<Bytes>>> {
     let id = Id::new(cache_key);
     let storage = storage::current();
-    let bucket = storage.selector().select(&id)?;
-    let meta = bucket.lookup(&id).ok().flatten()?;
+    let mut bucket = storage.select_hot(&id);
+    let mut meta = bucket.as_ref().and_then(|b| b.lookup(&id).ok().flatten());
+    if meta.is_none() {
+        bucket = storage.select_cold(&id);
+        meta = bucket.as_ref().and_then(|b| b.lookup(&id).ok().flatten());
+    }
+    let bucket = bucket?;
+    let meta = meta?;
+    storage::tiered::maybe_promote(bucket.as_ref(), &meta);
     let chunk_size = if meta.block_size > 0 {
         meta.block_size
     } else {
@@ -1112,11 +1119,18 @@ async fn handle_storage_hit(
 ) -> Option<Response<Full<Bytes>>> {
     let id = Id::new(cache_key);
     let storage = storage::current();
-    let bucket = storage.selector().select(&id)?;
-    let meta = bucket.lookup(&id).ok().flatten()?;
+    let mut bucket = storage.select_hot(&id);
+    let mut meta = bucket.as_ref().and_then(|b| b.lookup(&id).ok().flatten());
+    if meta.is_none() {
+        bucket = storage.select_cold(&id);
+        meta = bucket.as_ref().and_then(|b| b.lookup(&id).ok().flatten());
+    }
+    let bucket = bucket?;
+    let meta = meta?;
     if !meta.has_complete() {
         return None;
     }
+    storage::tiered::maybe_promote(bucket.as_ref(), &meta);
     let body = read_storage_body(bucket.as_ref(), &meta).ok()?;
     let status = StatusCode::from_u16(meta.code as u16).unwrap_or(StatusCode::OK);
     let mut headers = header_map_from_meta(&meta);
@@ -1786,7 +1800,7 @@ fn store_to_storage(
 ) -> Option<CacheCompletedPayload> {
     let storage = storage::current();
     let id = Id::new(cache_key);
-    let bucket = storage.selector().select(&id)?;
+    let bucket = storage.select_hot(&id)?;
     let body_size = body.len() as u64;
     let size = total_size;
     let mut chunks = ChunkSet::default();
@@ -1857,6 +1871,7 @@ fn store_to_storage(
         meta.parts = parts;
     }
     let _ = bucket.store(&meta);
+    storage::tiered::maybe_write_through(bucket.as_ref(), &meta);
 
     if let Ok(uri) = cache_key.parse::<http::Uri>() {
         if let Some(host) = uri.host() {

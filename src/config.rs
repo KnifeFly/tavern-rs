@@ -24,6 +24,8 @@ pub struct Bootstrap {
     pub upstream: Upstream,
     #[serde(default)]
     pub storage: Storage,
+    #[serde(default)]
+    pub cache_tiers: CacheTiers,
 }
 
 impl Bootstrap {
@@ -158,6 +160,53 @@ pub struct Storage {
     pub slice_size: u64,
     #[serde(default)]
     pub buckets: Vec<Bucket>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CacheTiers {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub promote_on_hit: bool,
+    #[serde(default)]
+    pub write_through_cold: bool,
+    #[serde(default)]
+    pub demote_age_seconds: u64,
+    #[serde(default)]
+    pub demote_interval_seconds: u64,
+    #[serde(default = "default_async_workers")]
+    pub async_workers: usize,
+    #[serde(default = "default_async_queue_size")]
+    pub async_queue_size: usize,
+    #[serde(default)]
+    pub demote_batch: usize,
+}
+
+impl Default for CacheTiers {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            promote_on_hit: true,
+            write_through_cold: false,
+            demote_age_seconds: 0,
+            demote_interval_seconds: 0,
+            async_workers: default_async_workers(),
+            async_queue_size: default_async_queue_size(),
+            demote_batch: 0,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_async_workers() -> usize {
+    4
+}
+
+fn default_async_queue_size() -> usize {
+    10000
 }
 
 #[derive(Debug, Deserialize, Default)]

@@ -47,6 +47,7 @@ const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     let store = storage::native::NativeStorage::new(&cfg.storage)?;
     storage::set_default(store);
+    storage::tiered::init(&cfg.cache_tiers);
 
     crate::middleware::caching::register_middleware();
     crate::middleware::multirange::register_middleware();

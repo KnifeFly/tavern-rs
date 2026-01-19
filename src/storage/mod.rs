@@ -12,6 +12,7 @@ pub mod sharedkv;
 pub mod object;
 pub mod selector;
 pub mod native;
+pub mod tiered;
 
 pub trait StorageReader: Read + Seek + Send {}
 impl<T: Read + Seek + Send> StorageReader for T {}
@@ -76,6 +77,21 @@ pub trait Storage: Send + Sync {
     fn shared_kv(&self) -> Arc<dyn SharedKV>;
     fn selector(&self) -> Arc<dyn Selector>;
     fn purge(&self, store_url: &str, control: PurgeControl) -> Result<()>;
+    fn bucket_by_id(&self, _id: &str) -> Option<Arc<dyn Bucket>> {
+        None
+    }
+    fn hot_buckets(&self) -> Vec<Arc<dyn Bucket>> {
+        Vec::new()
+    }
+    fn cold_buckets(&self) -> Vec<Arc<dyn Bucket>> {
+        Vec::new()
+    }
+    fn select_hot(&self, id: &object::Id) -> Option<Arc<dyn Bucket>> {
+        self.selector().select(id)
+    }
+    fn select_cold(&self, _id: &object::Id) -> Option<Arc<dyn Bucket>> {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]

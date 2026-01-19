@@ -18,6 +18,10 @@ pub struct NativeStorage {
     shared_kv: Arc<dyn SharedKV>,
     selector: Arc<dyn Selector>,
     bucket_by_id: HashMap<String, Arc<dyn crate::storage::Bucket>>,
+    hot_buckets: Vec<Arc<dyn crate::storage::Bucket>>,
+    cold_buckets: Vec<Arc<dyn crate::storage::Bucket>>,
+    hot_selector: Arc<dyn Selector>,
+    cold_selector: Option<Arc<dyn Selector>>,
 }
 
 impl NativeStorage {
@@ -103,9 +107,13 @@ impl NativeStorage {
             }
         }
 
-        let selector: Arc<dyn Selector> = match cfg.selection_policy.as_str() {
-            "roundrobin" => Arc::new(RoundRobinSelector::new(buckets.clone())),
-            _ => Arc::new(HashRingSelector::new(buckets.clone())),
+        let selector = build_selector(cfg.selection_policy.as_str(), buckets.clone());
+        let (hot_buckets, cold_buckets) = split_tiers(&buckets);
+        let hot_selector = build_selector(cfg.selection_policy.as_str(), hot_buckets.clone());
+        let cold_selector = if cold_buckets.is_empty() {
+            None
+        } else {
+            Some(build_selector(cfg.selection_policy.as_str(), cold_buckets.clone()))
         };
 
         Ok(Arc::new(Self {
@@ -113,25 +121,46 @@ impl NativeStorage {
             shared_kv,
             selector,
             bucket_by_id,
+            hot_buckets,
+            cold_buckets,
+            hot_selector,
+            cold_selector,
         }))
     }
 
     fn purge_single(&self, store_url: &str) -> Result<()> {
         let id = Id::new(store_url);
-        let bucket = self
-            .selector
-            .select(&id)
-            .ok_or_else(|| anyhow!("bucket not found"))?;
-        bucket.discard(&id)?;
-        let ix_key = format!("ix/{}/{}", bucket.id(), id.key());
-        let _ = self.shared_kv.delete(ix_key.as_bytes());
-        if let Ok(uri) = store_url.parse::<http::Uri>() {
-            if let Some(host) = uri.host() {
-                let key = format!("if/domain/{host}");
-                let _ = self.shared_kv.decr(key.as_bytes(), 1);
+        if let Some(bucket) = self.hot_selector.select(&id) {
+            if bucket.exist(&id.hash().0) {
+                bucket.discard(&id)?;
+                let ix_key = format!("ix/{}/{}", bucket.id(), id.key());
+                let _ = self.shared_kv.delete(ix_key.as_bytes());
+                if let Ok(uri) = store_url.parse::<http::Uri>() {
+                    if let Some(host) = uri.host() {
+                        let key = format!("if/domain/{host}");
+                        let _ = self.shared_kv.decr(key.as_bytes(), 1);
+                    }
+                }
+                return Ok(());
             }
         }
-        Ok(())
+        if let Some(selector) = &self.cold_selector {
+            if let Some(bucket) = selector.select(&id) {
+                if bucket.exist(&id.hash().0) {
+                    bucket.discard(&id)?;
+                    let ix_key = format!("ix/{}/{}", bucket.id(), id.key());
+                    let _ = self.shared_kv.delete(ix_key.as_bytes());
+                    if let Ok(uri) = store_url.parse::<http::Uri>() {
+                        if let Some(host) = uri.host() {
+                            let key = format!("if/domain/{host}");
+                            let _ = self.shared_kv.decr(key.as_bytes(), 1);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow!("bucket not found"))
     }
 
     fn purge_dir(&self, store_url: &str, control: PurgeControl) -> Result<()> {
@@ -241,4 +270,47 @@ impl Storage for NativeStorage {
         }
         self.purge_single(store_url)
     }
+
+    fn bucket_by_id(&self, id: &str) -> Option<Arc<dyn Bucket>> {
+        self.bucket_by_id.get(id).cloned()
+    }
+
+    fn hot_buckets(&self) -> Vec<Arc<dyn Bucket>> {
+        self.hot_buckets.clone()
+    }
+
+    fn cold_buckets(&self) -> Vec<Arc<dyn Bucket>> {
+        self.cold_buckets.clone()
+    }
+
+    fn select_hot(&self, id: &Id) -> Option<Arc<dyn Bucket>> {
+        self.hot_selector.select(id)
+    }
+
+    fn select_cold(&self, id: &Id) -> Option<Arc<dyn Bucket>> {
+        self.cold_selector.as_ref().and_then(|s| s.select(id))
+    }
+}
+
+fn build_selector(policy: &str, buckets: Vec<Arc<dyn Bucket>>) -> Arc<dyn Selector> {
+    match policy {
+        "roundrobin" => Arc::new(RoundRobinSelector::new(buckets)),
+        _ => Arc::new(HashRingSelector::new(buckets)),
+    }
+}
+
+fn split_tiers(buckets: &[Arc<dyn Bucket>]) -> (Vec<Arc<dyn Bucket>>, Vec<Arc<dyn Bucket>>) {
+    let mut hot = Vec::new();
+    let mut cold = Vec::new();
+    for bucket in buckets {
+        if bucket.store_type().eq_ignore_ascii_case("cold") {
+            cold.push(Arc::clone(bucket));
+        } else {
+            hot.push(Arc::clone(bucket));
+        }
+    }
+    if hot.is_empty() {
+        return (buckets.to_vec(), Vec::new());
+    }
+    (hot, cold)
 }

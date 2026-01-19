@@ -14,7 +14,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use rand::RngCore;
-use tavern::config::{Bootstrap, Logger, MiddlewareConfig, Server, Storage, Upstream};
+use tavern::config::{Bootstrap, CacheTiers, Logger, MiddlewareConfig, Server, Storage, Upstream};
 use tavern::constants;
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
@@ -88,6 +88,7 @@ fn test_config() -> Bootstrap {
             slice_size: 524_288,
             buckets: Vec::new(),
         },
+        cache_tiers: CacheTiers::default(),
     }
 }
 
