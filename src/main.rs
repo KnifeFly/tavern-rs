@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -47,6 +48,7 @@ async fn main() -> Result<()> {
     cfg.validate()?;
 
     log::info!("tavern starting with config {}", cli.config.display());
+    start_config_watcher(cli.config.clone());
 
     server::run(Arc::new(cfg)).await
 }
@@ -59,4 +61,57 @@ fn write_pid(path: &str) -> Result<()> {
     }
     std::fs::write(&path, pid.to_string()).with_context(|| format!("write pid file {}", path.display()))?;
     Ok(())
+}
+
+fn start_config_watcher(path: PathBuf) {
+    #[cfg(unix)]
+    {
+        use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::sync::mpsc::channel;
+
+        let dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let filename = path.file_name().map(|s| s.to_os_string());
+        std::thread::spawn(move || {
+            let (tx, rx) = channel();
+            let mut watcher = match RecommendedWatcher::new(tx, notify::Config::default()) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    log::warn!("config watcher init failed: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                log::warn!("config watcher start failed: {err}");
+                return;
+            }
+            let mut last = Instant::now() - Duration::from_secs(1);
+            for res in rx {
+                let event = match res {
+                    Ok(event) => event,
+                    Err(err) => {
+                        log::warn!("config watcher error: {err}");
+                        continue;
+                    }
+                };
+                if let Some(name) = filename.as_ref() {
+                    if !event.paths.iter().any(|p| p.file_name() == Some(name.as_ref())) {
+                        continue;
+                    }
+                }
+                match event.kind {
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {}
+                    _ => continue,
+                }
+                if last.elapsed() < Duration::from_millis(300) {
+                    continue;
+                }
+                last = Instant::now();
+                log::info!("config changed, triggering graceful reload");
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::this(),
+                    nix::sys::signal::Signal::SIGUSR1,
+                );
+            }
+        });
+    }
 }

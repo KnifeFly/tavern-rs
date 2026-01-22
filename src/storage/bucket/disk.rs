@@ -9,7 +9,7 @@ use anyhow::Result;
 use crate::storage::bucket::lru::{EvictionPolicy, EvictionTracker};
 use crate::storage::indexdb::IndexDB;
 use crate::storage::object::{Id, IdHash, Metadata};
-use crate::storage::{BoxedReader, BoxedWriter, Bucket, SharedKV};
+use crate::storage::{self, BoxedReader, BoxedWriter, Bucket, SharedKV};
 use crate::metrics;
 
 pub struct DiskBucket {
@@ -221,7 +221,7 @@ impl Bucket for DiskBucket {
             .map(|m| m.dev().to_string())
             .unwrap_or_else(|_| "-".to_string());
         metrics::record_disk_io(&dev, &self.path.to_string_lossy());
-        Ok((Box::new(file), path))
+        Ok((storage::rate_limit_writer(Box::new(file)), path))
     }
 
     fn read_chunk_file(&self, id: &Id, index: u32) -> Result<(BoxedReader, PathBuf)> {
@@ -231,6 +231,9 @@ impl Bucket for DiskBucket {
             .map(|m| m.dev().to_string())
             .unwrap_or_else(|_| "-".to_string());
         metrics::record_disk_io(&dev, &self.path.to_string_lossy());
-        Ok((Box::new(BufReader::new(file)), path))
+        Ok((
+            storage::rate_limit_reader(Box::new(BufReader::new(file))),
+            path,
+        ))
     }
 }

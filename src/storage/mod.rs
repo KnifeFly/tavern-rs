@@ -1,10 +1,12 @@
 use std::collections::HashMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
+
+use crate::config;
 
 pub mod bucket;
 pub mod indexdb;
@@ -91,6 +93,137 @@ pub trait Storage: Send + Sync {
     }
     fn select_cold(&self, _id: &object::Id) -> Option<Arc<dyn Bucket>> {
         None
+    }
+}
+
+struct IoLimiter {
+    read: Option<Arc<Mutex<RateLimiter>>>,
+    write: Option<Arc<Mutex<RateLimiter>>>,
+}
+
+struct RateLimiter {
+    rate: u64,
+    burst: u64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    fn new(rate: u64, burst: u64) -> Self {
+        let burst = burst.max(rate).max(1);
+        Self {
+            rate: rate.max(1),
+            burst,
+            tokens: burst as f64,
+            last: Instant::now(),
+        }
+    }
+
+    fn acquire(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        let added = elapsed * self.rate as f64;
+        self.tokens = (self.tokens + added).min(self.burst as f64);
+        self.last = now;
+        if self.tokens >= bytes as f64 {
+            self.tokens -= bytes as f64;
+            return;
+        }
+        let needed = bytes as f64 - self.tokens;
+        let wait = needed / self.rate as f64;
+        self.tokens = 0.0;
+        std::thread::sleep(Duration::from_secs_f64(wait));
+        self.last = Instant::now();
+    }
+}
+
+struct RateLimitedReader {
+    inner: BoxedReader,
+    limiter: Arc<Mutex<RateLimiter>>,
+}
+
+impl Read for RateLimitedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            let mut limiter = self.limiter.lock().expect("io limiter");
+            limiter.acquire(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+impl Seek for RateLimitedReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+struct RateLimitedWriter {
+    inner: BoxedWriter,
+    limiter: Arc<Mutex<RateLimiter>>,
+}
+
+impl Write for RateLimitedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            let mut limiter = self.limiter.lock().expect("io limiter");
+            limiter.acquire(n as u64);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+static IO_LIMITER: OnceLock<IoLimiter> = OnceLock::new();
+
+pub fn set_io_limits(cfg: &config::Storage) {
+    let burst = if cfg.io_burst_bytes > 0 {
+        cfg.io_burst_bytes
+    } else {
+        cfg.io_read_limit.max(cfg.io_write_limit)
+    };
+    let read = if cfg.io_read_limit > 0 {
+        Some(Arc::new(Mutex::new(RateLimiter::new(
+            cfg.io_read_limit,
+            burst,
+        ))))
+    } else {
+        None
+    };
+    let write = if cfg.io_write_limit > 0 {
+        Some(Arc::new(Mutex::new(RateLimiter::new(
+            cfg.io_write_limit,
+            burst,
+        ))))
+    } else {
+        None
+    };
+    let _ = IO_LIMITER.set(IoLimiter { read, write });
+}
+
+pub fn rate_limit_reader(reader: BoxedReader) -> BoxedReader {
+    let limiter = IO_LIMITER.get().and_then(|l| l.read.as_ref().cloned());
+    if let Some(limiter) = limiter {
+        Box::new(RateLimitedReader { inner: reader, limiter })
+    } else {
+        reader
+    }
+}
+
+pub fn rate_limit_writer(writer: BoxedWriter) -> BoxedWriter {
+    let limiter = IO_LIMITER.get().and_then(|l| l.write.as_ref().cloned());
+    if let Some(limiter) = limiter {
+        Box::new(RateLimitedWriter { inner: writer, limiter })
+    } else {
+        writer
     }
 }
 

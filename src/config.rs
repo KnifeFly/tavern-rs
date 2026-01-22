@@ -159,6 +159,12 @@ pub struct Storage {
     #[serde(default)]
     pub slice_size: u64,
     #[serde(default)]
+    pub io_read_limit: u64,
+    #[serde(default)]
+    pub io_write_limit: u64,
+    #[serde(default)]
+    pub io_burst_bytes: u64,
+    #[serde(default)]
     pub buckets: Vec<Bucket>,
 }
 

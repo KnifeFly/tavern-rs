@@ -26,6 +26,7 @@ pub struct NativeStorage {
 
 impl NativeStorage {
     pub fn new(cfg: &config::Storage) -> Result<Arc<Self>> {
+        crate::storage::set_io_limits(cfg);
         let shared_kv = build_shared_kv(cfg);
         let _ = shared_kv.drop_prefix(b"if/domain/");
         let _ = shared_kv.drop_prefix(b"ix/");
