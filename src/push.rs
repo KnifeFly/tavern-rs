@@ -70,7 +70,8 @@ pub(crate) async fn handle(req: Request<Incoming>, state: &AppState) -> Response
     let push = if body_bytes.is_empty() {
         parse_query(&parts.uri)
     } else {
-        serde_json::from_slice::<PushRequest>(&body_bytes).unwrap_or_else(|_| parse_query(&parts.uri))
+        serde_json::from_slice::<PushRequest>(&body_bytes)
+            .unwrap_or_else(|_| parse_query(&parts.uri))
     };
     let Some(action) = resolve_action(&push) else {
         return text_response(StatusCode::BAD_REQUEST, "missing action");
@@ -83,64 +84,20 @@ pub(crate) async fn handle(req: Request<Incoming>, state: &AppState) -> Response
     let mut results = Vec::new();
     for url in urls {
         let result = match action {
-            PushAction::Prefetch => {
-                match caching::prefetch_url(&state.cache_state, &url).await {
-                    Ok(()) => PushResult {
-                        url,
-                        ok: true,
-                        message: "prefetch ok".to_string(),
-                    },
-                    Err(err) => PushResult {
-                        url,
-                        ok: false,
-                        message: err.to_string(),
-                    },
-                }
-            }
-            PushAction::Expire => {
-                let res = storage::current().purge(
-                    &url,
-                    storage::PurgeControl {
-                        hard: false,
-                        dir,
-                        mark_expired: true,
-                    },
-                );
-                match res {
-                    Ok(()) => PushResult {
-                        url,
-                        ok: true,
-                        message: "expired".to_string(),
-                    },
-                    Err(err) => PushResult {
-                        url,
-                        ok: false,
-                        message: err.to_string(),
-                    },
-                }
-            }
-            PushAction::Delete => {
-                let res = storage::current().purge(
-                    &url,
-                    storage::PurgeControl {
-                        hard: true,
-                        dir,
-                        mark_expired: false,
-                    },
-                );
-                match res {
-                    Ok(()) => PushResult {
-                        url,
-                        ok: true,
-                        message: "deleted".to_string(),
-                    },
-                    Err(err) => PushResult {
-                        url,
-                        ok: false,
-                        message: err.to_string(),
-                    },
-                }
-            }
+            PushAction::Prefetch => match caching::prefetch_url(&state.cache_state, &url).await {
+                Ok(()) => PushResult {
+                    url,
+                    ok: true,
+                    message: "prefetch ok".to_string(),
+                },
+                Err(err) => PushResult {
+                    url,
+                    ok: false,
+                    message: err.to_string(),
+                },
+            },
+            PushAction::Expire => expire_url(state, url, dir).await,
+            PushAction::Delete => delete_url(state, url, dir).await,
         };
         results.push(result);
     }
@@ -155,6 +112,108 @@ pub(crate) async fn handle(req: Request<Incoming>, state: &AppState) -> Response
             results,
         },
     )
+}
+
+async fn expire_url(state: &AppState, url: String, dir: bool) -> PushResult {
+    let cache_key = match state.cache_state.cache_key_for_url(&url) {
+        Ok(cache_key) => cache_key,
+        Err(err) => {
+            return PushResult {
+                url,
+                ok: false,
+                message: err.to_string(),
+            };
+        }
+    };
+    let memory_expired = if dir {
+        state
+            .cache_state
+            .expire_url_prefix(&url)
+            .await
+            .unwrap_or(false)
+    } else {
+        state.cache_state.expire_url(&url).await.unwrap_or(false)
+    };
+    let storage_result = storage::current().purge(
+        &cache_key,
+        storage::PurgeControl {
+            hard: false,
+            dir,
+            mark_expired: true,
+        },
+    );
+    match storage_result {
+        Ok(()) => PushResult {
+            url,
+            ok: true,
+            message: if memory_expired {
+                "expired memory and storage".to_string()
+            } else {
+                "expired storage".to_string()
+            },
+        },
+        Err(err) if memory_expired => PushResult {
+            url,
+            ok: true,
+            message: format!("expired memory; storage: {err}"),
+        },
+        Err(err) => PushResult {
+            url,
+            ok: false,
+            message: err.to_string(),
+        },
+    }
+}
+
+async fn delete_url(state: &AppState, url: String, dir: bool) -> PushResult {
+    let cache_key = match state.cache_state.cache_key_for_url(&url) {
+        Ok(cache_key) => cache_key,
+        Err(err) => {
+            return PushResult {
+                url,
+                ok: false,
+                message: err.to_string(),
+            };
+        }
+    };
+    let memory_removed = if dir {
+        state
+            .cache_state
+            .remove_url_prefix(&url)
+            .await
+            .unwrap_or(false)
+    } else {
+        state.cache_state.remove_url(&url).await.unwrap_or(false)
+    };
+    let storage_result = storage::current().purge(
+        &cache_key,
+        storage::PurgeControl {
+            hard: true,
+            dir,
+            mark_expired: false,
+        },
+    );
+    match storage_result {
+        Ok(()) => PushResult {
+            url,
+            ok: true,
+            message: if memory_removed {
+                "deleted memory and storage".to_string()
+            } else {
+                "deleted storage".to_string()
+            },
+        },
+        Err(err) if memory_removed => PushResult {
+            url,
+            ok: true,
+            message: format!("deleted memory; storage: {err}"),
+        },
+        Err(err) => PushResult {
+            url,
+            ok: false,
+            message: err.to_string(),
+        },
+    }
 }
 
 fn parse_query(uri: &http::Uri) -> PushRequest {

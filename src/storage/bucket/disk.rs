@@ -1,16 +1,16 @@
 use std::fs::{self, File};
 use std::io::BufReader;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 
+use crate::metrics;
 use crate::storage::bucket::lru::{EvictionPolicy, EvictionTracker};
 use crate::storage::indexdb::IndexDB;
 use crate::storage::object::{Id, IdHash, Metadata};
 use crate::storage::{self, BoxedReader, BoxedWriter, Bucket, SharedKV};
-use crate::metrics;
 
 pub struct DiskBucket {
     id: String,

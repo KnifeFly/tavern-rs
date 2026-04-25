@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger as FlexiLogger, Naming, WriteMode};
+use flexi_logger::{
+    Cleanup, Criterion, Duplicate, FileSpec, Logger as FlexiLogger, Naming, WriteMode,
+};
 use log::LevelFilter;
 use tokio::task_local;
 
@@ -50,7 +52,11 @@ pub fn init(config: &Logger, verbose: bool) -> Result<()> {
         if config.max_size > 0 {
             let naming = Naming::Numbers;
             let cleanup = cleanup_policy(config);
-            file_logger = file_logger.rotate(Criterion::Size(config.max_size * 1024 * 1024), naming, cleanup);
+            file_logger = file_logger.rotate(
+                Criterion::Size(config.max_size * 1024 * 1024),
+                naming,
+                cleanup,
+            );
         }
 
         logger = file_logger.write_mode(WriteMode::BufferAndFlush);

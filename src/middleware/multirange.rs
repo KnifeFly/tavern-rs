@@ -9,8 +9,8 @@ use rand::Rng;
 
 use crate::config::MiddlewareConfig;
 use crate::constants;
-use crate::middleware::{Cleanup, Middleware, RoundTripper};
 use crate::middleware::registry::register;
+use crate::middleware::{Cleanup, Middleware, RoundTripper};
 use crate::proxy::ReverseProxy;
 use crate::upstream::UpstreamClient;
 
@@ -28,7 +28,11 @@ pub fn build(cfg: &MiddlewareConfig) -> Result<(Middleware, Cleanup)> {
     let opts = parse_options(cfg)?;
     let middleware: Middleware = Arc::new(move |next: Arc<dyn RoundTripper>| {
         let opts = opts.clone();
-        Arc::new(MultirangeMiddleware { next, opts, state: None }) as Arc<dyn RoundTripper>
+        Arc::new(MultirangeMiddleware {
+            next,
+            opts,
+            state: None,
+        }) as Arc<dyn RoundTripper>
     });
     Ok((middleware, crate::middleware::empty_cleanup))
 }
@@ -104,8 +108,7 @@ impl RoundTripper for MultirangeMiddleware {
                 if range.contains(',') {
                     if opts.merge || state.is_none() {
                         let first = range.split(',').next().unwrap_or(&range).trim();
-                        req.headers_mut()
-                            .insert("Range", first.parse().unwrap());
+                        req.headers_mut().insert("Range", first.parse().unwrap());
                         return next.round_trip(req).await;
                     }
                     return handle_multirange(req, state.expect("state")).await;
@@ -190,7 +193,10 @@ struct PrefetchResponse {
     headers: HeaderMap,
 }
 
-async fn prefetch_resource(req: &Request<Incoming>, state: &MultirangeState) -> Result<PrefetchResponse> {
+async fn prefetch_resource(
+    req: &Request<Incoming>,
+    state: &MultirangeState,
+) -> Result<PrefetchResponse> {
     let mut headers = HeaderMap::new();
     copy_headers(req.headers(), &mut headers);
     headers.insert("Range", "bytes=0-0".parse().unwrap());
@@ -212,8 +218,12 @@ async fn fetch_single_range(
     range: Option<RangeSpec>,
 ) -> Result<Response<Full<Bytes>>> {
     if let Some(range) = range {
-        req.headers_mut()
-            .insert("Range", format!("bytes={}-{}", range.start, range.end).parse().unwrap());
+        req.headers_mut().insert(
+            "Range",
+            format!("bytes={}-{}", range.start, range.end)
+                .parse()
+                .unwrap(),
+        );
     }
     let uri = build_upstream_uri(&req, state)?;
     let mut headers = HeaderMap::new();
@@ -243,12 +253,11 @@ async fn fetch_range_body(
     headers.remove(constants::INTERNAL_UPSTREAM_ADDR);
     headers.insert(
         "Range",
-        format!("bytes={}-{}", range.start, range.end).parse().unwrap(),
+        format!("bytes={}-{}", range.start, range.end)
+            .parse()
+            .unwrap(),
     );
-    let (status, _headers, body) = state
-        .upstream
-        .fetch(Method::GET, uri, headers)
-        .await?;
+    let (status, _headers, body) = state.upstream.fetch(Method::GET, uri, headers).await?;
     if status != StatusCode::PARTIAL_CONTENT && status != StatusCode::OK {
         return Err(anyhow::anyhow!("upstream range fetch failed"));
     }

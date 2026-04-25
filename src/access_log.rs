@@ -3,9 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::Result;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
+use anyhow::Result;
 use base64::Engine;
 use chrono::Local;
 use rand::RngCore;
@@ -30,10 +30,7 @@ impl AccessLogger {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
             (AccessWriter::File(file), Some(path.to_path_buf()))
         } else {
             (AccessWriter::Stdout(std::io::stdout()), None)
@@ -118,6 +115,9 @@ impl AccessEncryptor {
         let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        format!("{}\n", base64::engine::general_purpose::STANDARD.encode(out))
+        format!(
+            "{}\n",
+            base64::engine::general_purpose::STANDARD.encode(out)
+        )
     }
 }

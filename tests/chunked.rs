@@ -13,9 +13,7 @@ async fn test_chunked_interrupted() {
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         let _ = stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\r\n",
-            )
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\r\n")
             .await;
         let _ = stream.write_all(b"c\r\npartial-body\r\n").await;
         let _ = stream.shutdown().await;
@@ -25,7 +23,10 @@ async fn test_chunked_interrupted() {
     let client: Client<_, Full<bytes::Bytes>> =
         Client::builder(TokioExecutor::new()).build(connector);
     let uri: http::Uri = format!("http://{}/", addr).parse().unwrap();
-    let req = Request::builder().uri(uri).body(Full::new(bytes::Bytes::new())).unwrap();
+    let req = Request::builder()
+        .uri(uri)
+        .body(Full::new(bytes::Bytes::new()))
+        .unwrap();
     let resp = client.request(req).await.expect("response");
     assert_eq!(resp.status(), http::StatusCode::OK);
     let body = resp.into_body().collect().await;

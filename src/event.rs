@@ -50,7 +50,9 @@ where
 {
     let name = topic.name.clone();
     let mut map = registry().lock().expect("event registry");
-    let listeners = map.get_mut(&name).ok_or_else(|| anyhow::anyhow!("topic {} not found", name))?;
+    let listeners = map
+        .get_mut(&name)
+        .ok_or_else(|| anyhow::anyhow!("topic {} not found", name))?;
     let listener: Listener = Arc::new(move |ctx, payload| {
         if let Some(typed) = payload.downcast_ref::<T>() {
             handler(ctx, typed);
@@ -60,7 +62,11 @@ where
     Ok(())
 }
 
-pub fn publish<T: Any + Send + Sync + 'static>(topic: &TopicKey<T>, ctx: &EventContext, payload: T) {
+pub fn publish<T: Any + Send + Sync + 'static>(
+    topic: &TopicKey<T>,
+    ctx: &EventContext,
+    payload: T,
+) {
     publish_by_name(&topic.name, ctx, &payload);
 }
 

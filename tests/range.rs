@@ -28,14 +28,13 @@ async fn test_range_offset() {
         .await;
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(resp.body().len(), 524_288);
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("MISS")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("MISS"));
 
     // HIT
     let case2 = E2E::new(
@@ -50,14 +49,13 @@ async fn test_range_offset() {
         .await;
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(resp.body().len(), 524_288);
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("HIT")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("HIT"));
 
     // PART_MISS
     let case3 = E2E::new(
@@ -75,14 +73,13 @@ async fn test_range_offset() {
         .await;
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(resp.body().len(), 524_288);
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("PART_MISS")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("PART_MISS"));
 
     // PART_HIT
     let case4 = E2E::new(
@@ -101,20 +98,17 @@ async fn test_range_offset() {
     let hash_body = hash_bytes(resp.body());
     let hash_file = hash_bytes(&read_range(&file.path, 524_288, 1_048_576));
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("PART_HIT")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("PART_HIT"));
     assert_eq!(hash_body, hash_file);
 
     let purge_resp = case4.purge().await;
-    assert!(
-        purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -160,9 +154,7 @@ async fn test_range_overflow() {
     assert_eq!(resp.body().len(), 2);
 
     let purge_resp = case3.purge().await;
-    assert!(
-        purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -180,14 +172,13 @@ async fn test_range_revalidate() {
     )
     .await;
     let resp = case1.do_request(|_, _| {}).await;
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("MISS")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("MISS"));
 
     // HIT
     let case2 = E2E::new(
@@ -200,14 +191,13 @@ async fn test_range_revalidate() {
             headers.insert("Range", range_header(0, Some(524_287)).parse().unwrap());
         })
         .await;
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("HIT")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("HIT"));
 
     // Revalidate HIT (304)
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -215,7 +205,12 @@ async fn test_range_revalidate() {
     let case3 = E2E::new(
         "http://sendya.me.gslb.com/cases/range/full-cache/1-1",
         move |req| {
-            let et = req.headers().get("If-None-Match").unwrap().to_str().unwrap();
+            let et = req
+                .headers()
+                .get("If-None-Match")
+                .unwrap()
+                .to_str()
+                .unwrap();
             assert_eq!(et, file_md5);
             let lm = req.headers().get("If-Modified-Since");
             assert!(lm.is_some());
@@ -234,14 +229,13 @@ async fn test_range_revalidate() {
             headers.insert("Range", range_header(0, Some(524_287)).parse().unwrap());
         })
         .await;
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("REVALIDATE_HIT")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("REVALIDATE_HIT"));
 
     // Revalidate MISS (file changed)
     file = gen_file(5 << 20);
@@ -251,7 +245,12 @@ async fn test_range_revalidate() {
     let case4 = E2E::new(
         "http://sendya.me.gslb.com/cases/range/full-cache/1-1",
         move |req| {
-            let et = req.headers().get("If-None-Match").unwrap().to_str().unwrap();
+            let et = req
+                .headers()
+                .get("If-None-Match")
+                .unwrap()
+                .to_str()
+                .unwrap();
             assert_ne!(et, new_md5);
             let mut headers = http::HeaderMap::new();
             headers.insert("Cache-Control", "max-age=2".parse().unwrap());
@@ -270,17 +269,14 @@ async fn test_range_revalidate() {
             headers.insert("Range", range_header(0, Some(524_287)).parse().unwrap());
         })
         .await;
-    assert!(
-        resp.headers()
-            .get("X-Cache")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("REVALIDATE_MISS")
-    );
+    assert!(resp
+        .headers()
+        .get("X-Cache")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("REVALIDATE_MISS"));
 
     let purge_resp = case4.purge().await;
-    assert!(
-        purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND);
 }

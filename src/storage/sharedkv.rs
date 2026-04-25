@@ -98,10 +98,7 @@ impl SledSharedKV {
 
 impl SharedKV for SledSharedKV {
     fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
-        let val = self
-            .db
-            .get(key)?
-            .ok_or_else(|| anyhow!("key not found"))?;
+        let val = self.db.get(key)?.ok_or_else(|| anyhow!("key not found"))?;
         Ok(val.to_vec())
     }
 
@@ -189,10 +186,7 @@ impl RocksSharedKV {
 
 impl SharedKV for RocksSharedKV {
     fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
-        let val = self
-            .db
-            .get(key)?
-            .ok_or_else(|| anyhow!("key not found"))?;
+        let val = self.db.get(key)?.ok_or_else(|| anyhow!("key not found"))?;
         Ok(val.to_vec())
     }
 
@@ -304,10 +298,7 @@ impl SharedKV for RedbSharedKV {
         let write_txn = self.db.begin_write()?;
         let next = {
             let mut table = write_txn.open_table(REDB_SHARED_TABLE)?;
-            let cur = table
-                .get(key)?
-                .map(|v| read_u32(v.value()))
-                .unwrap_or(0);
+            let cur = table.get(key)?.map(|v| read_u32(v.value())).unwrap_or(0);
             let next = cur.saturating_add(delta);
             table.insert(key, write_u32(next).as_slice())?;
             next
@@ -320,10 +311,7 @@ impl SharedKV for RedbSharedKV {
         let write_txn = self.db.begin_write()?;
         let next = {
             let mut table = write_txn.open_table(REDB_SHARED_TABLE)?;
-            let cur = table
-                .get(key)?
-                .map(|v| read_u32(v.value()))
-                .unwrap_or(0);
+            let cur = table.get(key)?.map(|v| read_u32(v.value())).unwrap_or(0);
             let next = cur.saturating_sub(delta);
             table.insert(key, write_u32(next).as_slice())?;
             next

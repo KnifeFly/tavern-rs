@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 
+[features]
+compress = []
+
 [dependencies]
 anyhow = "1"
 aes-gcm = "0.10"

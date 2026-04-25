@@ -1,0 +1,11 @@
+/target/
+
+# Runtime cache/index data. Configure these paths per deployment.
+/index/
+/bucket-*/
+/.indexdb/
+
+# Local config, logs, and process files.
+/config.yaml
+*.log
+*.pid

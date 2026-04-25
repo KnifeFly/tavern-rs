@@ -57,9 +57,11 @@ fn write_pid(path: &str) -> Result<()> {
     let pid = std::process::id();
     let path = PathBuf::from(path);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create pid dir {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create pid dir {}", parent.display()))?;
     }
-    std::fs::write(&path, pid.to_string()).with_context(|| format!("write pid file {}", path.display()))?;
+    std::fs::write(&path, pid.to_string())
+        .with_context(|| format!("write pid file {}", path.display()))?;
     Ok(())
 }
 

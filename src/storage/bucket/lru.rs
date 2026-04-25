@@ -98,14 +98,17 @@ impl EvictionTracker {
 
     fn pop_oldest(&mut self) -> Option<IdHash> {
         match self.policy {
-            EvictionPolicy::Lru | EvictionPolicy::Fifo => self.order.shift_remove_index(0).map(|v| v.0),
+            EvictionPolicy::Lru | EvictionPolicy::Fifo => {
+                self.order.shift_remove_index(0).map(|v| v.0)
+            }
             EvictionPolicy::Lfu => {
                 let mut selected: Option<(IdHash, u64, u64)> = None;
                 for (key, (count, order)) in self.lfu.iter() {
                     match selected {
                         None => selected = Some((*key, *count, *order)),
                         Some((_, best_count, best_order)) => {
-                            if *count < best_count || (*count == best_count && *order < best_order) {
+                            if *count < best_count || (*count == best_count && *order < best_order)
+                            {
                                 selected = Some((*key, *count, *order));
                             }
                         }

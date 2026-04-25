@@ -15,8 +15,8 @@ use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::event::{self, CacheCompletedPayload};
 use crate::config;
+use crate::event::{self, CacheCompletedPayload};
 use crate::plugin::Plugin;
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +156,10 @@ async fn send_report(
     payload: ReportPayload,
 ) -> Result<()> {
     let body = serde_json::to_vec(&payload)?;
-    let uri: http::Uri = options.endpoint.parse().map_err(|_| anyhow!("invalid endpoint"))?;
+    let uri: http::Uri = options
+        .endpoint
+        .parse()
+        .map_err(|_| anyhow!("invalid endpoint"))?;
 
     let req = Request::builder()
         .method("POST")
@@ -191,7 +194,12 @@ async fn send_report(
     Ok(())
 }
 
-fn read_and_sum_hash(basepath: PathBuf, cache_key: &str, count: usize, chunk_size: u64) -> Result<String> {
+fn read_and_sum_hash(
+    basepath: PathBuf,
+    cache_key: &str,
+    count: usize,
+    chunk_size: u64,
+) -> Result<String> {
     let mut ctx = md5::Context::new();
     for i in 0..count {
         let path = basepath.join(format!("{cache_key}-{i:06}"));
@@ -199,11 +207,7 @@ fn read_and_sum_hash(basepath: PathBuf, cache_key: &str, count: usize, chunk_siz
         let mut buf = Vec::new();
         let n = file.read_to_end(&mut buf)?;
         if i + 1 < count && n as u64 != chunk_size {
-            return Err(anyhow!(
-                "chunk size mismatch {} expected {}",
-                n,
-                chunk_size
-            ));
+            return Err(anyhow!("chunk size mismatch {} expected {}", n, chunk_size));
         }
         ctx.consume(&buf);
     }

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http::header::HOST;
+use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use rand::Rng;
@@ -15,10 +15,12 @@ use crate::cache::{CacheEntry, CacheStatus, CacheStore};
 use crate::config::MiddlewareConfig;
 use crate::constants;
 use crate::event::{CacheCompletedPayload, EventContext};
-use crate::http_range::{build_content_range, parse_content_range, parse_range, RangeError, RangeSpec};
+use crate::http_range::{
+    build_content_range, parse_content_range, parse_range, RangeError, RangeSpec,
+};
 use crate::metrics;
-use crate::middleware::{Cleanup, Middleware, RoundTripper};
 use crate::middleware::registry::register;
+use crate::middleware::{Cleanup, Middleware, RoundTripper};
 use crate::proxy::singleflight::Group;
 use crate::proxy::ReverseProxy;
 use crate::storage;
@@ -71,6 +73,31 @@ impl CachingState {
 
     pub fn upstream_addrs(&self) -> Vec<String> {
         self.upstream_addrs.clone()
+    }
+
+    pub(crate) fn cache_key_for_url(&self, url: &str) -> Result<String> {
+        let uri: http::Uri = url.parse().map_err(|_| anyhow!("invalid url"))?;
+        cache_key_from_uri(&uri, self.include_query).ok_or_else(|| anyhow!("invalid url"))
+    }
+
+    pub(crate) async fn remove_url(&self, url: &str) -> Result<bool> {
+        let cache_key = self.cache_key_for_url(url)?;
+        Ok(self.cache.remove_key_and_variants(&cache_key).await > 0)
+    }
+
+    pub(crate) async fn remove_url_prefix(&self, url: &str) -> Result<bool> {
+        let cache_key = self.cache_key_for_url(url)?;
+        Ok(self.cache.remove_prefix(&cache_key).await > 0)
+    }
+
+    pub(crate) async fn expire_url(&self, url: &str) -> Result<bool> {
+        let cache_key = self.cache_key_for_url(url)?;
+        Ok(self.cache.expire_key_and_variants(&cache_key).await > 0)
+    }
+
+    pub(crate) async fn expire_url_prefix(&self, url: &str) -> Result<bool> {
+        let cache_key = self.cache_key_for_url(url)?;
+        Ok(self.cache.expire_prefix(&cache_key).await > 0)
     }
 }
 
@@ -133,10 +160,7 @@ impl Config {
             .iter()
             .map(|v| v.to_ascii_lowercase())
             .collect();
-        let fill_range_percent = opts
-            .fill_range_percent
-            .unwrap_or(100)
-            .min(100);
+        let fill_range_percent = opts.fill_range_percent.unwrap_or(100).min(100);
         let object_pool_enabled = opts.object_pool_enabled.unwrap_or(false);
         let object_pool_size = opts.object_pool_size.unwrap_or(0);
         let async_flush_chunk = opts.async_flush_chunk.unwrap_or(false);
@@ -197,11 +221,7 @@ pub fn build_with_state(
     let middleware: Middleware = Arc::new(move |next: Arc<dyn RoundTripper>| {
         let state = Arc::clone(&state);
         let opts = opts.clone();
-        Arc::new(CachingMiddlewareWithState {
-            next,
-            state,
-            opts,
-        }) as Arc<dyn RoundTripper>
+        Arc::new(CachingMiddlewareWithState { next, state, opts }) as Arc<dyn RoundTripper>
     });
     Ok((middleware, crate::middleware::empty_cleanup))
 }
@@ -221,7 +241,10 @@ struct CachingMiddleware {
 }
 
 impl RoundTripper for CachingMiddleware {
-    fn round_trip(&self, req: Request<Incoming>) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    fn round_trip(
+        &self,
+        req: Request<Incoming>,
+    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
         let next = Arc::clone(&self.next);
         let _opts = self.opts.clone();
         Box::pin(async move { next.round_trip(req).await })
@@ -235,7 +258,10 @@ struct CachingMiddlewareWithState {
 }
 
 impl RoundTripper for CachingMiddlewareWithState {
-    fn round_trip(&self, req: Request<Incoming>) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    fn round_trip(
+        &self,
+        req: Request<Incoming>,
+    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
         let next = Arc::clone(&self.next);
         let state = Arc::clone(&self.state);
         let opts = self.opts.clone();
@@ -253,16 +279,18 @@ async fn handle_request(
     touch_object_pool_config(&cfg);
     let method = req.method().clone();
     if method != Method::GET && method != Method::HEAD {
-        return Ok(text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"));
+        return Ok(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
     }
 
-    let base_key = build_cache_key(&req, cfg.include_query)
-        .ok_or_else(|| anyhow!("invalid host"))?;
+    let base_key =
+        build_cache_key(&req, cfg.include_query).ok_or_else(|| anyhow!("invalid host"))?;
     let range_header = req.headers().get("Range").and_then(|v| v.to_str().ok());
     let prefetch = req.headers().contains_key(constants::PREFETCH_CACHE_KEY);
 
-    let (cache_key, entry_opt) =
-        resolve_cache_entry(&req, &state, &cfg, base_key.clone()).await?;
+    let (cache_key, entry_opt) = resolve_cache_entry(&req, &state, &cfg, base_key.clone()).await?;
 
     if let Some(entry) = entry_opt {
         if !entry.is_expired() {
@@ -504,7 +532,10 @@ async fn handle_cache_miss(
     if let Some(cr) = content_range_header {
         response_headers.insert("Content-Range", cr.parse().unwrap());
     }
-    response_headers.insert("Content-Length", resp_body.len().to_string().parse().unwrap());
+    response_headers.insert(
+        "Content-Length",
+        resp_body.len().to_string().parse().unwrap(),
+    );
     response_headers.insert(
         constants::PROTOCOL_CACHE_STATUS_KEY,
         CacheStatus::Miss.as_str().parse().unwrap(),
@@ -544,7 +575,8 @@ async fn handle_cache_miss(
 
     if cacheable {
         if let Some(vary) = headers.get("Vary").and_then(|v| v.to_str().ok()) {
-            if let Some(vary_entry) = build_vary_index(vary, cache_key, req, &response_headers, status, ttl, cfg)
+            if let Some(vary_entry) =
+                build_vary_index(vary, cache_key, req, &response_headers, status, ttl, cfg)
             {
                 let vary_key = vary_entry.0;
                 let vary_index = vary_entry.1;
@@ -716,7 +748,10 @@ async fn handle_cache_hit(
         };
 
         if has_full_body {
-            state.cache.update(cache_key, |e| e.mark_chunks(&chunks)).await;
+            state
+                .cache
+                .update(cache_key, |e| e.mark_chunks(&chunks))
+                .await;
         }
 
         if range_header.is_some() {
@@ -756,7 +791,10 @@ async fn handle_cache_hit(
     if let Some(cr) = content_range {
         headers.insert("Content-Range", cr.parse().unwrap());
     }
-    headers.insert("Content-Length", resp_body.len().to_string().parse().unwrap());
+    headers.insert(
+        "Content-Length",
+        resp_body.len().to_string().parse().unwrap(),
+    );
 
     if req.method() == Method::HEAD {
         return empty_with_headers(resp_status, headers);
@@ -767,8 +805,8 @@ async fn handle_cache_hit(
 
 pub(crate) async fn prefetch_url(state: &CachingState, url: &str) -> Result<()> {
     let uri: http::Uri = url.parse().map_err(|_| anyhow!("invalid url"))?;
-    let cache_key = cache_key_from_uri(&uri, state.include_query)
-        .ok_or_else(|| anyhow!("invalid url"))?;
+    let cache_key =
+        cache_key_from_uri(&uri, state.include_query).ok_or_else(|| anyhow!("invalid url"))?;
     if let Some(entry) = state.cache.get(&cache_key).await {
         if !entry.is_expired() {
             return Ok(());
@@ -935,10 +973,7 @@ fn serve_storage_range(
             .parse()
             .ok()?,
     );
-    headers.insert(
-        "Content-Length",
-        body.len().to_string().parse().ok()?,
-    );
+    headers.insert("Content-Length", body.len().to_string().parse().ok()?);
 
     if req.method() == Method::HEAD {
         return Some(empty_with_headers(StatusCode::PARTIAL_CONTENT, headers));
@@ -1001,12 +1036,14 @@ async fn fetch_range_and_store(
         cfg.chunk_size,
         cfg.fill_range_percent,
     );
-    let upstream = fetch_upstream_with_range(req, state, filled).await.unwrap_or(UpstreamOutcome {
-        ok: false,
-        status: StatusCode::BAD_GATEWAY,
-        headers: HeaderMap::new(),
-        body: Bytes::new(),
-    });
+    let upstream = fetch_upstream_with_range(req, state, filled)
+        .await
+        .unwrap_or(UpstreamOutcome {
+            ok: false,
+            status: StatusCode::BAD_GATEWAY,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        });
     if !upstream.ok {
         return text_response(StatusCode::BAD_GATEWAY, "upstream error");
     }
@@ -1140,8 +1177,7 @@ async fn handle_storage_hit(
         CacheStatus::Hit.as_str().parse().ok()?,
     );
 
-    let (resp_status, resp_body, content_range) =
-        build_body_with_range(status, range_header, body);
+    let (resp_status, resp_body, content_range) = build_body_with_range(status, range_header, body);
     if let Some(cr) = content_range {
         headers.insert("Content-Range", cr.parse().ok()?);
     }
@@ -1202,7 +1238,10 @@ async fn handle_revalidate(
             if let Some(cr) = content_range {
                 response_headers.insert("Content-Range", cr.parse().unwrap());
             }
-            response_headers.insert("Content-Length", resp_body.len().to_string().parse().unwrap());
+            response_headers.insert(
+                "Content-Length",
+                resp_body.len().to_string().parse().unwrap(),
+            );
             response_headers.insert(
                 constants::PROTOCOL_CACHE_STATUS_KEY,
                 CacheStatus::RevalidateMiss.as_str().parse().unwrap(),
@@ -1220,6 +1259,20 @@ async fn handle_revalidate(
                 );
                 new_entry.is_vary_index = false;
                 state.cache.insert(cache_key.to_string(), new_entry).await;
+                if let Some(payload) = store_to_storage(
+                    cache_key,
+                    status,
+                    &headers,
+                    &response_headers,
+                    &body,
+                    0,
+                    body.len() as u64,
+                    ttl,
+                    cfg.chunk_size,
+                    cfg.async_flush_chunk,
+                ) {
+                    (state.cache_completed_pub)(&EventContext, payload);
+                }
             } else {
                 state.cache.remove(cache_key).await;
             }
@@ -1284,13 +1337,19 @@ fn serve_cached_with_status(
     range_header: Option<&str>,
 ) -> Response<Full<Bytes>> {
     let mut headers = entry.headers.clone();
-    headers.insert(constants::PROTOCOL_CACHE_STATUS_KEY, status.as_str().parse().unwrap());
+    headers.insert(
+        constants::PROTOCOL_CACHE_STATUS_KEY,
+        status.as_str().parse().unwrap(),
+    );
     let (resp_status, resp_body, content_range) =
         build_body_with_range(entry.status, range_header, entry.body.clone());
     if let Some(cr) = content_range {
         headers.insert("Content-Range", cr.parse().unwrap());
     }
-    headers.insert("Content-Length", resp_body.len().to_string().parse().unwrap());
+    headers.insert(
+        "Content-Length",
+        resp_body.len().to_string().parse().unwrap(),
+    );
     if req.method() == Method::HEAD {
         return empty_with_headers(resp_status, headers);
     }
@@ -1393,7 +1452,11 @@ async fn fetch_upstream_snapshot(
     }
     headers.remove(constants::INTERNAL_UPSTREAM_ADDR);
     headers.remove("Range");
-    match state.upstream.fetch(snapshot.method.clone(), uri, headers).await {
+    match state
+        .upstream
+        .fetch(snapshot.method.clone(), uri, headers)
+        .await
+    {
         Ok((status, headers, body)) => Ok(UpstreamOutcome {
             ok: true,
             status,
@@ -1428,7 +1491,11 @@ async fn fetch_upstream_snapshot_keep_range(
         }
     }
     headers.remove(constants::INTERNAL_UPSTREAM_ADDR);
-    match state.upstream.fetch(snapshot.method.clone(), uri, headers).await {
+    match state
+        .upstream
+        .fetch(snapshot.method.clone(), uri, headers)
+        .await
+    {
         Ok((status, headers, body)) => Ok(UpstreamOutcome {
             ok: true,
             status,
@@ -1556,12 +1623,7 @@ fn chunk_hint_for_range(
     Some(chunk_range_from_spec(filled, chunk_size))
 }
 
-fn fill_range_spec(
-    range: RangeSpec,
-    size: u64,
-    chunk_size: u64,
-    fill_percent: u64,
-) -> RangeSpec {
+fn fill_range_spec(range: RangeSpec, size: u64, chunk_size: u64, fill_percent: u64) -> RangeSpec {
     if chunk_size == 0 || fill_percent == 0 || size == 0 {
         return range;
     }
@@ -1612,7 +1674,10 @@ fn touch_object_pool_config(cfg: &Config) {
 }
 
 fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
-    if let Some(val) = headers.get(constants::CACHE_TIME).and_then(|v| v.to_str().ok()) {
+    if let Some(val) = headers
+        .get(constants::CACHE_TIME)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Ok(secs) = val.parse::<u64>() {
             if secs > 0 {
                 return Some(Duration::from_secs(secs));
@@ -1640,7 +1705,6 @@ fn cache_expiry_at(now: Instant, ttl: Option<Duration>) -> Instant {
     }
 }
 
-
 fn is_cacheable(status: StatusCode, headers: &HeaderMap, ttl: Option<Duration>) -> bool {
     if ttl.is_none() {
         return false;
@@ -1656,7 +1720,11 @@ fn is_cacheable(status: StatusCode, headers: &HeaderMap, ttl: Option<Duration>) 
 }
 
 fn build_cache_key(req: &Request<Incoming>, include_query: bool) -> Option<String> {
-    if let Some(val) = req.headers().get("X-Store-Url").and_then(|v| v.to_str().ok()) {
+    if let Some(val) = req
+        .headers()
+        .get("X-Store-Url")
+        .and_then(|v| v.to_str().ok())
+    {
         if let Ok(uri) = val.parse::<http::Uri>() {
             let scheme = uri.scheme_str().unwrap_or("http");
             if let Some(authority) = uri.authority() {
@@ -1674,9 +1742,17 @@ fn build_cache_key(req: &Request<Incoming>, include_query: bool) -> Option<Strin
         .uri()
         .authority()
         .map(|a| a.as_str().to_string())
-        .or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()).map(|v| v.to_string()))?;
+        .or_else(|| {
+            req.headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string())
+        })?;
     let path = if include_query {
-        req.uri().path_and_query().map(|v| v.as_str()).unwrap_or("/")
+        req.uri()
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or("/")
     } else {
         req.uri().path()
     };
@@ -1943,7 +2019,11 @@ fn snapshot_request(req: &Request<Incoming>) -> RequestSnapshot {
     }
 }
 
-fn response_with_headers(status: StatusCode, headers: HeaderMap, body: Bytes) -> Response<Full<Bytes>> {
+fn response_with_headers(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Full<Bytes>> {
     metrics::record(status);
     let mut builder = Response::builder().status(status);
     for (k, v) in headers.iter() {

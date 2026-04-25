@@ -42,7 +42,10 @@ pub async fn ensure_server() {
 fn test_config() -> Bootstrap {
     let mut middleware = Vec::new();
     let mut opts = HashMap::new();
-    opts.insert("include_query_in_cache_key".to_string(), serde_yaml::Value::Bool(true));
+    opts.insert(
+        "include_query_in_cache_key".to_string(),
+        serde_yaml::Value::Bool(true),
+    );
     let caching = MiddlewareConfig {
         name: "caching".to_string(),
         options: opts,
@@ -129,6 +132,16 @@ impl TestClient {
     }
 
     pub async fn send(&self, method: Method, url: &str, headers: HeaderMap) -> TestResponse {
+        self.send_body(method, url, headers, Bytes::new()).await
+    }
+
+    pub async fn send_body(
+        &self,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> TestResponse {
         let stream = tokio::net::TcpStream::connect(self.proxy_addr)
             .await
             .expect("connect proxy");
@@ -148,19 +161,12 @@ impl TestClient {
         for (k, v) in headers.iter() {
             builder = builder.header(k, v);
         }
-        let req = builder
-            .body(Full::new(Bytes::new()))
-            .expect("request");
+        let req = builder.body(Full::new(body)).expect("request");
 
         let resp = sender.send_request(req).await.expect("send request");
         let status = resp.status();
         let headers = resp.headers().clone();
-        let body = resp
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
 
         TestResponse {
             status,
@@ -307,12 +313,18 @@ impl E2E {
             self.upstream.addr().to_string().parse().unwrap(),
         );
         self.client
-            .send(Method::from_bytes(b"PURGE").unwrap(), &self.case_url, headers)
+            .send(
+                Method::from_bytes(b"PURGE").unwrap(),
+                &self.case_url,
+                headers,
+            )
             .await
     }
 }
 
-pub fn resp_simple_file(file: &MockFile) -> impl Fn(http::Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync {
+pub fn resp_simple_file(
+    file: &MockFile,
+) -> impl Fn(http::Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync {
     let file = file.clone();
     move |_req: http::Request<Incoming>| {
         let bytes = std::fs::read(&file.path).expect("read file");
@@ -332,7 +344,10 @@ pub fn resp_simple_file(file: &MockFile) -> impl Fn(http::Request<Incoming>) -> 
     }
 }
 
-pub fn resp_callback_file<F>(file: &MockFile, cb: F) -> impl Fn(http::Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync
+pub fn resp_callback_file<F>(
+    file: &MockFile,
+    cb: F,
+) -> impl Fn(http::Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync
 where
     F: Fn(&http::Request<Incoming>, &mut HeaderMap) + Send + Sync + 'static,
 {
@@ -357,7 +372,9 @@ where
     }
 }
 
-pub fn resp_callback<F>(cb: F) -> impl Fn(http::Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync
+pub fn resp_callback<F>(
+    cb: F,
+) -> impl Fn(http::Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync
 where
     F: Fn(&http::Request<Incoming>, &mut HeaderMap) + Send + Sync + 'static,
 {

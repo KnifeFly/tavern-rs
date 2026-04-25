@@ -1,12 +1,12 @@
+pub mod access_log;
 pub mod cache;
 pub mod config;
 pub mod constants;
-pub mod access_log;
 pub mod event;
 pub mod http_range;
 pub mod logging;
-pub mod middleware;
 pub mod metrics;
+pub mod middleware;
 pub mod net;
 pub mod plugin;
 pub mod proxy;

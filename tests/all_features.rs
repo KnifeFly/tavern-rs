@@ -6,7 +6,9 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use support::*;
 
-fn resp_range_file(file: &MockFile) -> impl Fn(http::Request<Incoming>) -> http::Response<Full<Bytes>> + Send + Sync {
+fn resp_range_file(
+    file: &MockFile,
+) -> impl Fn(http::Request<Incoming>) -> http::Response<Full<Bytes>> + Send + Sync {
     let file = file.clone();
     move |req: http::Request<Incoming>| {
         let bytes = std::fs::read(&file.path).expect("read file");
@@ -24,13 +26,23 @@ fn resp_range_file(file: &MockFile) -> impl Fn(http::Request<Incoming>) -> http:
         let range = req.headers().get("Range").and_then(|v| v.to_str().ok());
         if let Some(raw) = range.and_then(|v| v.strip_prefix("bytes=")) {
             let parts: Vec<&str> = raw.splitn(2, '-').collect();
-            let start = parts.get(0).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let start = parts
+                .get(0)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             let end = parts
                 .get(1)
-                .and_then(|v| if v.is_empty() { None } else { v.parse::<u64>().ok() })
+                .and_then(|v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        v.parse::<u64>().ok()
+                    }
+                })
                 .unwrap_or_else(|| size.saturating_sub(1));
             if start >= size || end < start {
-                let mut builder = http::Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE);
+                let mut builder =
+                    http::Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE);
                 builder = builder.header("Content-Range", format!("bytes */{size}"));
                 return builder.body(Full::new(Bytes::new())).unwrap();
             }
@@ -80,7 +92,5 @@ async fn test_prefetch_range_fills_cache() {
     assert_eq!(hash_bytes(resp.body()), hash_bytes(&expected));
 
     let purge_resp = case2.purge().await;
-    assert!(
-        purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND);
 }

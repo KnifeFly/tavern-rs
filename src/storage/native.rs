@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 
 use crate::config;
-use crate::storage::bucket::{disk::DiskBucket, empty::EmptyBucket, memory::MemoryBucket};
 use crate::storage::bucket::lru::EvictionPolicy;
+use crate::storage::bucket::{disk::DiskBucket, empty::EmptyBucket, memory::MemoryBucket};
 use crate::storage::indexdb;
 use crate::storage::object::Id;
 use crate::storage::selector::{HashRingSelector, RoundRobinSelector};
@@ -74,7 +74,9 @@ impl NativeStorage {
                     "empty" => EmptyBucket::new(&format!("empty-{idx}")),
                     _ => {
                         if driver == "custom-driver" {
-                            log::warn!("custom-driver not supported, fallback to native disk bucket");
+                            log::warn!(
+                                "custom-driver not supported, fallback to native disk bucket"
+                            );
                         }
                         let path = if bucket_cfg.path.is_empty() {
                             PathBuf::from(format!("bucket-{idx}"))
@@ -114,7 +116,10 @@ impl NativeStorage {
         let cold_selector = if cold_buckets.is_empty() {
             None
         } else {
-            Some(build_selector(cfg.selection_policy.as_str(), cold_buckets.clone()))
+            Some(build_selector(
+                cfg.selection_policy.as_str(),
+                cold_buckets.clone(),
+            ))
         };
 
         Ok(Arc::new(Self {
@@ -129,17 +134,24 @@ impl NativeStorage {
         }))
     }
 
-    fn purge_single(&self, store_url: &str) -> Result<()> {
+    fn purge_single(&self, store_url: &str, control: PurgeControl) -> Result<()> {
         let id = Id::new(store_url);
         if let Some(bucket) = self.hot_selector.select(&id) {
             if bucket.exist(&id.hash().0) {
-                bucket.discard(&id)?;
-                let ix_key = format!("ix/{}/{}", bucket.id(), id.key());
-                let _ = self.shared_kv.delete(ix_key.as_bytes());
-                if let Ok(uri) = store_url.parse::<http::Uri>() {
-                    if let Some(host) = uri.host() {
-                        let key = format!("if/domain/{host}");
-                        let _ = self.shared_kv.decr(key.as_bytes(), 1);
+                if control.mark_expired && !control.hard {
+                    if let Some(mut meta) = bucket.lookup(&id)? {
+                        meta.expires_at = crate::storage::unix_now() - 1;
+                        bucket.store(&meta)?;
+                    }
+                } else {
+                    bucket.discard(&id)?;
+                    let ix_key = format!("ix/{}/{}", bucket.id(), id.key());
+                    let _ = self.shared_kv.delete(ix_key.as_bytes());
+                    if let Ok(uri) = store_url.parse::<http::Uri>() {
+                        if let Some(host) = uri.host() {
+                            let key = format!("if/domain/{host}");
+                            let _ = self.shared_kv.decr(key.as_bytes(), 1);
+                        }
                     }
                 }
                 return Ok(());
@@ -148,13 +160,20 @@ impl NativeStorage {
         if let Some(selector) = &self.cold_selector {
             if let Some(bucket) = selector.select(&id) {
                 if bucket.exist(&id.hash().0) {
-                    bucket.discard(&id)?;
-                    let ix_key = format!("ix/{}/{}", bucket.id(), id.key());
-                    let _ = self.shared_kv.delete(ix_key.as_bytes());
-                    if let Ok(uri) = store_url.parse::<http::Uri>() {
-                        if let Some(host) = uri.host() {
-                            let key = format!("if/domain/{host}");
-                            let _ = self.shared_kv.decr(key.as_bytes(), 1);
+                    if control.mark_expired && !control.hard {
+                        if let Some(mut meta) = bucket.lookup(&id)? {
+                            meta.expires_at = crate::storage::unix_now() - 1;
+                            bucket.store(&meta)?;
+                        }
+                    } else {
+                        bucket.discard(&id)?;
+                        let ix_key = format!("ix/{}/{}", bucket.id(), id.key());
+                        let _ = self.shared_kv.delete(ix_key.as_bytes());
+                        if let Ok(uri) = store_url.parse::<http::Uri>() {
+                            if let Some(host) = uri.host() {
+                                let key = format!("if/domain/{host}");
+                                let _ = self.shared_kv.decr(key.as_bytes(), 1);
+                            }
                         }
                     }
                     return Ok(());
@@ -169,9 +188,9 @@ impl NativeStorage {
         if !control.mark_expired {
             for bucket in &self.buckets {
                 let prefix = format!("ix/{}/{store_url}", bucket.id());
-                let _ = self.shared_kv.iterate_prefix(
-                    prefix.as_bytes(),
-                    &mut |key, val| {
+                let _ = self
+                    .shared_kv
+                    .iterate_prefix(prefix.as_bytes(), &mut |key, val| {
                         if val.len() < crate::storage::object::ID_HASH_SIZE {
                             return Ok(());
                         }
@@ -184,8 +203,7 @@ impl NativeStorage {
                         }
                         let _ = self.shared_kv.delete(key);
                         Ok(())
-                    },
-                );
+                    });
             }
         }
 
@@ -269,7 +287,7 @@ impl Storage for NativeStorage {
         if control.dir {
             return self.purge_dir(store_url, control);
         }
-        self.purge_single(store_url)
+        self.purge_single(store_url, control)
     }
 
     fn bucket_by_id(&self, id: &str) -> Option<Arc<dyn Bucket>> {

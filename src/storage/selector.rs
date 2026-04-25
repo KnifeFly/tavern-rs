@@ -47,10 +47,7 @@ impl Selector for HashRingSelector {
             return None;
         }
         let hash = hash_bytes(&id.hash().0);
-        let mut idx = match state
-            .ring
-            .binary_search_by(|entry| entry.hash.cmp(&hash))
-        {
+        let mut idx = match state.ring.binary_search_by(|entry| entry.hash.cmp(&hash)) {
             Ok(pos) => pos,
             Err(pos) => {
                 if pos >= state.ring.len() {

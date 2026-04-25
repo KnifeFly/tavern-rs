@@ -21,7 +21,9 @@ pub fn register(name: &str, factory: Factory) {
 pub fn create(cfg: &MiddlewareConfig) -> Result<(Middleware, Cleanup)> {
     let name = format!("tavern.middleware.{}", cfg.name.to_lowercase());
     let map = registry().lock().expect("middleware registry");
-    let factory = map.get(&name).ok_or_else(|| anyhow!("middleware not found"))?;
+    let factory = map
+        .get(&name)
+        .ok_or_else(|| anyhow!("middleware not found"))?;
     let (mw, cleanup) = factory(cfg)?;
     Ok((mw, cleanup))
 }

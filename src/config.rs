@@ -279,7 +279,8 @@ pub struct Plugin {
 }
 
 pub fn load(path: &Path) -> Result<(Bootstrap, Vec<String>)> {
-    let raw = fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     let mut ignored = Vec::new();
     let de = serde_yaml::Deserializer::from_str(&raw);
     let cfg: Bootstrap = serde_ignored::deserialize(de, |path| {

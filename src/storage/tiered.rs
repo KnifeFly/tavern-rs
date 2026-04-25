@@ -5,9 +5,9 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::{self, Duration};
 
 use crate::config::CacheTiers;
+use crate::metrics;
 use crate::storage::object::{IdHash, Metadata};
 use crate::storage::{self, Bucket};
-use crate::metrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MigrationMode {
@@ -93,10 +93,7 @@ pub fn on_storage_hit(bucket: &dyn Bucket, meta: &Metadata, is_range: bool) {
     }
     let storage = storage::current();
     let key = format!("if/hit/{}", meta.id.hash_str());
-    let hits = storage
-        .shared_kv()
-        .incr(key.as_bytes(), 1)
-        .unwrap_or(0);
+    let hits = storage.shared_kv().incr(key.as_bytes(), 1).unwrap_or(0);
     if is_range {
         let rkey = format!("if/range/{}", meta.id.hash_str());
         let _ = storage.shared_kv().incr(rkey.as_bytes(), 1);
@@ -187,9 +184,8 @@ async fn process_task_with_retry(task: MigrationTask) -> Result<&'static str, &'
 async fn process_task(task: &MigrationTask) -> anyhow::Result<()> {
     let cfg = SETTINGS.get().cloned().unwrap_or_default();
     if cfg.rate_limit_per_sec > 0 {
-        let per_worker = (cfg.async_workers.max(1) as u64)
-            .saturating_mul(1_000)
-            / cfg.rate_limit_per_sec as u64;
+        let per_worker =
+            (cfg.async_workers.max(1) as u64).saturating_mul(1_000) / cfg.rate_limit_per_sec as u64;
         if per_worker > 0 {
             time::sleep(Duration::from_millis(per_worker)).await;
         }

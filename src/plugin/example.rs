@@ -62,14 +62,16 @@ impl Plugin for ExamplePlugin {
         router.add("/plugin/store/service-domains", move |_req| {
             let store = storage::current();
             let mut domain_map = std::collections::HashMap::<String, u32>::new();
-            let _ = store.shared_kv().iterate_prefix(b"if/domain", &mut |key, val| {
-                if key.len() > 10 && val.len() >= 4 {
-                    let domain = String::from_utf8_lossy(&key[10..]).to_string();
-                    let count = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
-                    domain_map.insert(domain, count);
-                }
-                Ok(())
-            });
+            let _ = store
+                .shared_kv()
+                .iterate_prefix(b"if/domain", &mut |key, val| {
+                    if key.len() > 10 && val.len() >= 4 {
+                        let domain = String::from_utf8_lossy(&key[10..]).to_string();
+                        let count = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
+                        domain_map.insert(domain, count);
+                    }
+                    Ok(())
+                });
             json_response_with_opts(&domain_map, &opts)
         });
     }
@@ -108,7 +110,11 @@ struct SimpleMetadata {
 impl SimpleMetadata {
     fn from_meta(meta: &Metadata, use_hash: bool) -> Self {
         Self {
-            id: if use_hash { meta.id.hash_str() } else { meta.id.key() },
+            id: if use_hash {
+                meta.id.hash_str()
+            } else {
+                meta.id.key()
+            },
             chunks: conv_range(&meta.chunks),
             code: meta.code,
             size: meta.size,

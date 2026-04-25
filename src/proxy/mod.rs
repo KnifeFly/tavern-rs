@@ -94,11 +94,11 @@ impl ReverseProxy {
         uri: Uri,
         headers: HeaderMap,
     ) -> Result<(http::StatusCode, HeaderMap, Bytes)> {
-        let node = self.select_node().ok_or_else(|| anyhow!("no upstream nodes"))?;
+        let node = self
+            .select_node()
+            .ok_or_else(|| anyhow!("no upstream nodes"))?;
         let client = self.client_for(&node.address).await;
-        let mut req = http::Request::builder()
-            .method(method)
-            .uri(uri.clone());
+        let mut req = http::Request::builder().method(method).uri(uri.clone());
         for (k, v) in headers.iter() {
             req = req.header(k, v);
         }

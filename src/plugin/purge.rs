@@ -170,7 +170,9 @@ fn new_purge_plugin(cfg: &config::Plugin) -> Result<std::sync::Arc<dyn Plugin>> 
     let threshold_window = ThresholdWindow {
         start: Instant::now(),
         count: 0,
-        threshold: options.threshold.and_then(|v| if v > 0 { Some(v as u64) } else { None }),
+        threshold: options
+            .threshold
+            .and_then(|v| if v > 0 { Some(v as u64) } else { None }),
     };
     Ok(std::sync::Arc::new(PurgePlugin {
         options,
@@ -215,7 +217,9 @@ impl PurgePlugin {
             Ok(win) => win,
             Err(_) => return false,
         };
-        let Some(threshold) = window.threshold else { return false };
+        let Some(threshold) = window.threshold else {
+            return false;
+        };
         if window.start.elapsed() > Duration::from_secs(60) {
             window.start = Instant::now();
             window.count = 0;
@@ -225,7 +229,9 @@ impl PurgePlugin {
     }
 
     fn log_purge(&self, status: StatusCode, url: &str, dir: bool, exceeded: bool) {
-        let Some(writer) = &self.log_writer else { return };
+        let Some(writer) = &self.log_writer else {
+            return;
+        };
         let stamp = storage::unix_now();
         let line = format!(
             "{} status={} dir={} exceeded={} url={}\n",

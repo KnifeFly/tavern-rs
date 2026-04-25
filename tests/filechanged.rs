@@ -81,9 +81,7 @@ async fn test_content_length_changed() {
     assert_eq!(resp.headers().get("ETag").unwrap(), f2.md5.as_str());
 
     let purge_resp = case3.purge().await;
-    assert!(
-        purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -92,9 +90,8 @@ async fn test_last_modified_changed() {
     let f2 = gen_file(1 << 20);
 
     let old_lm = httpdate::fmt_http_date(std::time::SystemTime::now());
-    let new_lm = httpdate::fmt_http_date(
-        std::time::SystemTime::now() + std::time::Duration::from_secs(2),
-    );
+    let new_lm =
+        httpdate::fmt_http_date(std::time::SystemTime::now() + std::time::Duration::from_secs(2));
     let old_lm_header = old_lm.clone();
     let new_lm_case2 = new_lm.clone();
     let new_lm_case3 = new_lm.clone();
@@ -148,9 +145,7 @@ async fn test_last_modified_changed() {
     assert_eq!(resp.headers().get("X-Case").unwrap(), "new-file");
 
     let purge_resp = case3.purge().await;
-    assert!(
-        purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -205,7 +200,5 @@ async fn test_etag_changed() {
     assert_eq!(resp.headers().get("ETag").unwrap(), f2.md5.as_str());
 
     let purge_resp = case3.purge().await;
-    assert!(
-        purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(purge_resp.status() == StatusCode::OK || purge_resp.status() == StatusCode::NOT_FOUND);
 }

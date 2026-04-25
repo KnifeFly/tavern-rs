@@ -8,8 +8,8 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 
 use crate::config::MiddlewareConfig;
-use crate::middleware::{Cleanup, Middleware, RoundTripper};
 use crate::middleware::registry::register;
+use crate::middleware::{Cleanup, Middleware, RoundTripper};
 
 #[derive(Debug, serde::Deserialize, Default, Clone)]
 struct HeadersPolicy {

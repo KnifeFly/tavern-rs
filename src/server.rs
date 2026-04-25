@@ -1,13 +1,14 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::{env, io::Write};
-use std::io::Read;
 
-use base64::Engine;
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use bytes::Bytes;
+use chrono::Local;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
@@ -16,30 +17,29 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::rt::TokioTimer;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use tokio::net::{TcpListener, UnixListener};
-use tokio::net::lookup_host;
-use tokio::time::Duration;
 use pprof::protos::Message;
-use chrono::Local;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use tokio::net::lookup_host;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::watch;
+use tokio::time::Duration;
 
+use crate::access_log::{AccessEncryptor, AccessLogger};
 use crate::cache::CacheStore;
 use crate::config::{Bootstrap, MiddlewareConfig};
 use crate::constants;
-use crate::access_log::{AccessEncryptor, AccessLogger};
-use crate::logging;
 use crate::event::{self, CacheCompletedPayload, EventContext};
-use crate::middleware::{self, RoundTripper};
-use crate::middleware::caching::CachingState;
+use crate::logging;
 use crate::metrics;
+use crate::middleware::caching::CachingState;
+use crate::middleware::{self, RoundTripper};
+use crate::net::RemoteAddr;
 use crate::plugin::{Plugin, Router};
-use crate::push;
 use crate::proxy::{self, Node};
+use crate::push;
 use crate::runtime;
 use crate::storage;
 use crate::upstream::UpstreamClient;
-use crate::net::RemoteAddr;
 
 const DEFAULT_LOCAL_HOSTS: &[&str] = &["localhost", "127.0.0.1", "127.1"];
 const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
@@ -69,7 +69,10 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
         event::CACHE_COMPLETED_KEY,
     ));
     let proxy_policy = proxy::BalancePolicy::from_str(&cfg.upstream.balancing);
-    let proxy = Arc::new(proxy::ReverseProxy::new(build_upstream_nodes(&cfg).await, proxy_policy));
+    let proxy = Arc::new(proxy::ReverseProxy::new(
+        build_upstream_nodes(&cfg).await,
+        proxy_policy,
+    ));
     let access_logger = build_access_logger(&cfg);
     let pprof_auth = cfg
         .server
@@ -120,7 +123,9 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     notify_ready();
     let result = match listener {
         ListenerKind::Tcp(listener) => run_tcp(listener, shutdown_rx, Arc::clone(&state)).await,
-        ListenerKind::Unix { listener, .. } => run_unix(listener, shutdown_rx, Arc::clone(&state)).await,
+        ListenerKind::Unix { listener, .. } => {
+            run_unix(listener, shutdown_rx, Arc::clone(&state)).await
+        }
     };
     if let Err(err) = result {
         return Err(err);
@@ -204,7 +209,9 @@ fn build_proxy_chain(
     for mw in &cfg.server.middleware {
         let name = mw.name.to_lowercase();
         let (mw_fn, _cleanup) = match name.as_str() {
-            "caching" => crate::middleware::caching::build_with_state(mw, Arc::clone(&cache_state))?,
+            "caching" => {
+                crate::middleware::caching::build_with_state(mw, Arc::clone(&cache_state))?
+            }
             "rewrite" => crate::middleware::rewrite::build(mw)?,
             "recovery" => crate::middleware::recovery::build(mw)?,
             "multirange" => {
@@ -254,7 +261,6 @@ fn find_caching_options(middlewares: &[MiddlewareConfig]) -> Option<CachingOptio
     }
     None
 }
-
 
 fn build_local_hosts(cfg: &Bootstrap) -> Arc<HashSet<String>> {
     let mut set = HashSet::new();
@@ -347,12 +353,14 @@ impl RoundTripper for UpstreamRoundTripper {
         let proxy = Arc::clone(&self.proxy);
         let upstream_addrs = self.upstream_addrs.clone();
         Box::pin(async move {
-            let upstream_addr = select_upstream_addr_from_headers(req.headers(), &proxy, &upstream_addrs)?;
+            let upstream_addr =
+                select_upstream_addr_from_headers(req.headers(), &proxy, &upstream_addrs)?;
             let uri = build_upstream_uri(&req, &upstream_addr)?;
             let mut headers = HeaderMap::new();
             copy_headers(req.headers(), &mut headers);
             headers.remove(constants::INTERNAL_UPSTREAM_ADDR);
-            let (status, headers, body) = upstream.fetch(req.method().clone(), uri, headers).await?;
+            let (status, headers, body) =
+                upstream.fetch(req.method().clone(), uri, headers).await?;
             Ok(response_with_headers(status, headers, body))
         })
     }
@@ -423,7 +431,10 @@ fn is_unix_addr(addr: &str) -> bool {
 
 enum ListenerKind {
     Tcp(TcpListener),
-    Unix { listener: UnixListener, path: String },
+    Unix {
+        listener: UnixListener,
+        path: String,
+    },
 }
 
 struct ListenerMeta {
@@ -434,14 +445,22 @@ struct ListenerMeta {
 
 fn inherited_listener(addr: &str) -> Option<ListenerMeta> {
     let fd = env::var("TAVERN_GRACEFUL_FD").ok()?.parse::<RawFd>().ok()?;
-    let kind = env::var("TAVERN_GRACEFUL_TYPE")
-        .unwrap_or_else(|_| if is_unix_addr(addr) { "unix".into() } else { "tcp".into() });
+    let kind = env::var("TAVERN_GRACEFUL_TYPE").unwrap_or_else(|_| {
+        if is_unix_addr(addr) {
+            "unix".into()
+        } else {
+            "tcp".into()
+        }
+    });
     let addr = env::var("TAVERN_GRACEFUL_ADDR").unwrap_or_else(|_| addr.to_string());
     let kind = if kind == "unix" { "unix" } else { "tcp" };
     Some(ListenerMeta { fd, kind, addr })
 }
 
-fn bind_listener(addr: &str, inherited: Option<ListenerMeta>) -> Result<(ListenerKind, ListenerMeta)> {
+fn bind_listener(
+    addr: &str,
+    inherited: Option<ListenerMeta>,
+) -> Result<(ListenerKind, ListenerMeta)> {
     if let Some(mut meta) = inherited {
         if meta.kind == "unix" {
             let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(meta.fd) };
@@ -469,7 +488,8 @@ fn bind_listener(addr: &str, inherited: Option<ListenerMeta>) -> Result<(Listene
         if path_ref.exists() {
             std::fs::remove_file(path_ref).ok();
         }
-        let listener = std::os::unix::net::UnixListener::bind(path_ref).context("bind unix socket")?;
+        let listener =
+            std::os::unix::net::UnixListener::bind(path_ref).context("bind unix socket")?;
         listener.set_nonblocking(true)?;
         let tokio_listener = UnixListener::from_std(listener)?;
         let meta = ListenerMeta {
@@ -515,7 +535,8 @@ fn spawn_signal_handlers(meta: ListenerMeta, cfg: Arc<Bootstrap>, shutdown: watc
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         {
             while sig.recv().await.is_some() {
-                if let Err(err) = spawn_upgrade(&upgrade_meta, &cfg, shutdown_upgrade.clone()).await {
+                if let Err(err) = spawn_upgrade(&upgrade_meta, &cfg, shutdown_upgrade.clone()).await
+                {
                     log::error!("graceful upgrade failed: {err}");
                 }
             }
@@ -523,32 +544,35 @@ fn spawn_signal_handlers(meta: ListenerMeta, cfg: Arc<Bootstrap>, shutdown: watc
     });
 
     tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-        loop {
-            tokio::select! {
-                _ = async {
-                    if let Some(sig) = sigterm.as_mut() {
-                        let _ = sig.recv().await;
-                    }
-                } => {
-                    let _ = shutdown.send(true);
-                    break;
-                }
-                _ = async {
-                    if let Some(sig) = sigint.as_mut() {
-                        let _ = sig.recv().await;
-                    }
-                } => {
-                    let _ = shutdown.send(true);
-                    break;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+
+        match (sigterm.as_mut(), sigint.as_mut()) {
+            (Some(sigterm), Some(sigint)) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = sigint.recv() => {}
                 }
             }
+            (Some(sigterm), None) => {
+                let _ = sigterm.recv().await;
+            }
+            (None, Some(sigint)) => {
+                let _ = sigint.recv().await;
+            }
+            (None, None) => return,
         }
+        let _ = shutdown.send(true);
     });
 }
 
-async fn spawn_upgrade(meta: &ListenerMeta, cfg: &Bootstrap, shutdown: watch::Sender<bool>) -> Result<()> {
+async fn spawn_upgrade(
+    meta: &ListenerMeta,
+    cfg: &Bootstrap,
+    shutdown: watch::Sender<bool>,
+) -> Result<()> {
     clear_cloexec(meta.fd)?;
     let (read_fd, write_fd) = nix::unistd::pipe().context("pipe")?;
     clear_cloexec(write_fd)?;
@@ -732,12 +756,19 @@ fn conn_timeout(cfg: &crate::config::Server) -> Option<Duration> {
     candidates.into_iter().min()
 }
 
-async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let req_info = RequestInfo::from_request(&req);
     let host = extract_host(&req);
     let is_local = host
         .as_ref()
-        .and_then(|h| h.split_once(':').map(|(h, _)| h).or_else(|| Some(h.as_str())))
+        .and_then(|h| {
+            h.split_once(':')
+                .map(|(h, _)| h)
+                .or_else(|| Some(h.as_str()))
+        })
         .map(|h| state.local_hosts.contains(h))
         .unwrap_or(false);
 
@@ -807,13 +838,17 @@ async fn handle_purge(req: &Request<Incoming>, state: &AppState) -> Response<Ful
         None => return text_response(StatusCode::BAD_REQUEST, "invalid host"),
     };
 
-    let existed = state.cache.remove(&cache_key).await;
     let purge_type = req
         .headers()
         .get("Purge-Type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let dir = purge_type.eq_ignore_ascii_case("dir");
+    let existed = if dir {
+        state.cache.remove_prefix(&cache_key).await > 0
+    } else {
+        state.cache.remove_key_and_variants(&cache_key).await > 0
+    };
     let _ = storage::current().purge(
         req.uri().to_string().as_str(),
         storage::PurgeControl {
@@ -835,9 +870,17 @@ fn build_cache_key(req: &Request<Incoming>, include_query: bool) -> Option<Strin
         .uri()
         .authority()
         .map(|a| a.as_str().to_string())
-        .or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()).map(|v| v.to_string()))?;
+        .or_else(|| {
+            req.headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string())
+        })?;
     let path = if include_query {
-        req.uri().path_and_query().map(|v| v.as_str()).unwrap_or("/")
+        req.uri()
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or("/")
     } else {
         req.uri().path()
     };
@@ -942,7 +985,11 @@ fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-fn response_with_headers(status: StatusCode, headers: HeaderMap, body: Bytes) -> Response<Full<Bytes>> {
+fn response_with_headers(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Full<Bytes>> {
     metrics::record(status);
     let mut builder = Response::builder().status(status);
     for (k, v) in headers.iter() {
@@ -1082,7 +1129,10 @@ async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full
     if !basic_auth_ok(&req, user, pass) {
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
-            .header("WWW-Authenticate", r#"Basic realm="restricted", charset="UTF-8""#)
+            .header(
+                "WWW-Authenticate",
+                r#"Basic realm="restricted", charset="UTF-8""#,
+            )
             .body(Full::new(Bytes::from("Unauthorized")))
             .unwrap();
     }

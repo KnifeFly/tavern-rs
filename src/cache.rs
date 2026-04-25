@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::HeaderMap;
-use tokio::sync::RwLock;
 use std::collections::VecDeque;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
@@ -139,6 +139,70 @@ impl CacheStore {
             return true;
         }
         false
+    }
+
+    pub async fn remove_key_and_variants(&self, key: &str) -> usize {
+        let mut inner = self.inner.write().await;
+        let variant_prefix = format!("{key}#vary:");
+        let keys: Vec<String> = inner
+            .map
+            .keys()
+            .filter(|candidate| candidate.as_str() == key || candidate.starts_with(&variant_prefix))
+            .cloned()
+            .collect();
+        let removed = keys.len();
+        for key in keys {
+            inner.map.remove(&key);
+        }
+        inner.order.retain(|candidate| {
+            candidate.as_str() != key && !candidate.starts_with(&variant_prefix)
+        });
+        removed
+    }
+
+    pub async fn remove_prefix(&self, prefix: &str) -> usize {
+        let mut inner = self.inner.write().await;
+        let keys: Vec<String> = inner
+            .map
+            .keys()
+            .filter(|candidate| candidate.starts_with(prefix))
+            .cloned()
+            .collect();
+        let removed = keys.len();
+        for key in keys {
+            inner.map.remove(&key);
+        }
+        inner
+            .order
+            .retain(|candidate| !candidate.starts_with(prefix));
+        removed
+    }
+
+    pub async fn expire_key_and_variants(&self, key: &str) -> usize {
+        let mut inner = self.inner.write().await;
+        let variant_prefix = format!("{key}#vary:");
+        let now = Instant::now();
+        let mut expired = 0;
+        for (candidate, entry) in inner.map.iter_mut() {
+            if candidate.as_str() == key || candidate.starts_with(&variant_prefix) {
+                entry.expires_at = now;
+                expired += 1;
+            }
+        }
+        expired
+    }
+
+    pub async fn expire_prefix(&self, prefix: &str) -> usize {
+        let mut inner = self.inner.write().await;
+        let now = Instant::now();
+        let mut expired = 0;
+        for (candidate, entry) in inner.map.iter_mut() {
+            if candidate.starts_with(prefix) {
+                entry.expires_at = now;
+                expired += 1;
+            }
+        }
+        expired
     }
 }
 

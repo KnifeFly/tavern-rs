@@ -6,11 +6,11 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use hyper_util::rt::TokioExecutor;
 use hyper_rustls::HttpsConnector;
 use hyper_rustls::HttpsConnectorBuilder;
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::TokioExecutor;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config;
 
@@ -86,7 +86,9 @@ impl UpstreamClient {
         for (k, v) in headers.iter() {
             req = req.header(k, v);
         }
-        let req = req.body(Full::new(Bytes::new())).context("build upstream request")?;
+        let req = req
+            .body(Full::new(Bytes::new()))
+            .context("build upstream request")?;
         let resp = self.client.request(req).await.context("upstream request")?;
         let status = resp.status();
         let headers = resp.headers().clone();
@@ -95,8 +97,12 @@ impl UpstreamClient {
     }
 
     async fn acquire_host_limit(&self, uri: &Uri) -> Option<OwnedSemaphorePermit> {
-        let Some(limit) = self.max_conns_per_host else { return None };
-        let Some(authority) = uri.authority() else { return None };
+        let Some(limit) = self.max_conns_per_host else {
+            return None;
+        };
+        let Some(authority) = uri.authority() else {
+            return None;
+        };
         let key = authority.as_str().to_string();
         let sem = {
             let mut map = self.host_limits.lock().expect("host limits");
@@ -114,7 +120,11 @@ impl UpstreamClient {
 }
 
 async fn collect_body(resp: http::Response<Incoming>) -> Result<Bytes> {
-    let body = resp.into_body().collect().await.context("read upstream body")?;
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .context("read upstream body")?;
     Ok(body.to_bytes())
 }
 
@@ -171,10 +181,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 }
 
 fn feature_enabled(features: &HashMap<String, serde_yaml::Value>, key: &str) -> bool {
-    features
-        .get(key)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    features.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 fn load_fd_limit() -> Option<Semaphore> {

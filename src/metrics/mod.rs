@@ -67,10 +67,7 @@ fn requests_code_total() -> &'static IntCounterVec {
     static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
     METRIC.get_or_init(|| {
         let counter = IntCounterVec::new(
-            Opts::new(
-                "tr_tavern_requests_code_total",
-                "Total processed requests",
-            ),
+            Opts::new("tr_tavern_requests_code_total", "Total processed requests"),
             &["protocol", "code"],
         )
         .unwrap();
@@ -124,11 +121,9 @@ fn disk_usage_gauge() -> &'static IntGaugeVec {
 fn disk_io_counter() -> &'static IntCounterVec {
     static METRIC: OnceLock<IntCounterVec> = OnceLock::new();
     METRIC.get_or_init(|| {
-        let counter = IntCounterVec::new(
-            Opts::new("tr_tavern_disk_io", "Disk IO"),
-            &["dev", "path"],
-        )
-        .unwrap();
+        let counter =
+            IntCounterVec::new(Opts::new("tr_tavern_disk_io", "Disk IO"), &["dev", "path"])
+                .unwrap();
         registry().register(Box::new(counter.clone())).unwrap();
         counter
     })
@@ -189,7 +184,9 @@ pub fn record(status: StatusCode) {
     init_metrics();
     requests_total().inc();
     let code = status.as_u16().to_string();
-    requests_status_total().with_label_values(&[code.as_str()]).inc();
+    requests_status_total()
+        .with_label_values(&[code.as_str()])
+        .inc();
     let protocol = current_protocol().unwrap_or_else(|| "HTTP/1.1".to_string());
     requests_code_total()
         .with_label_values(&[protocol.as_str(), code.as_str()])
@@ -210,9 +207,7 @@ pub fn record_verifier(code: &str) {
 
 pub fn record_disk_io(dev: &str, path: &str) {
     init_metrics();
-    disk_io_counter()
-        .with_label_values(&[dev, path])
-        .inc();
+    disk_io_counter().with_label_values(&[dev, path]).inc();
 }
 
 pub fn record_tiered_event(event: &str, ok: bool) {
@@ -271,7 +266,9 @@ pub async fn with_request_context<F, T>(protocol: String, method: String, fut: F
 where
     F: std::future::Future<Output = T>,
 {
-    REQUEST_CONTEXT.scope(RequestContext { protocol, method }, fut).await
+    REQUEST_CONTEXT
+        .scope(RequestContext { protocol, method }, fut)
+        .await
 }
 
 fn current_protocol() -> Option<String> {
@@ -293,8 +290,7 @@ fn disk_usage_metrics() -> Vec<DiskUsageMetric> {
         }
         let path = bucket.path().to_string_lossy().to_string();
         if let Ok(stat) = statvfs::statvfs(bucket.path()) {
-            let used = (stat.blocks() - stat.blocks_available()) as u64
-                * stat.block_size() as u64;
+            let used = (stat.blocks() - stat.blocks_available()) as u64 * stat.block_size() as u64;
             let dev = std::fs::metadata(bucket.path())
                 .map(|m| {
                     #[cfg(unix)]

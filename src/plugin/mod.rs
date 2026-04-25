@@ -73,11 +73,7 @@ impl Router {
         Some(handler(req))
     }
 
-    pub fn handle_path(
-        &self,
-        path: &str,
-        req: Request<Incoming>,
-    ) -> Option<Response<Full<Bytes>>> {
+    pub fn handle_path(&self, path: &str, req: Request<Incoming>) -> Option<Response<Full<Bytes>>> {
         let handler = self.routes.get(path)?;
         Some(handler(req))
     }

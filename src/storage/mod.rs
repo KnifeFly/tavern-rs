@@ -10,10 +10,10 @@ use crate::config;
 
 pub mod bucket;
 pub mod indexdb;
-pub mod sharedkv;
+pub mod native;
 pub mod object;
 pub mod selector;
-pub mod native;
+pub mod sharedkv;
 pub mod tiered;
 
 pub trait StorageReader: Read + Seek + Send {}
@@ -70,8 +70,11 @@ pub trait SharedKV: Send + Sync {
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn drop_prefix(&self, prefix: &[u8]) -> Result<()>;
     fn iterate(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()>;
-    fn iterate_prefix(&self, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>)
-        -> Result<()>;
+    fn iterate_prefix(
+        &self,
+        prefix: &[u8],
+        f: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()>;
 }
 
 pub trait Storage: Send + Sync {
