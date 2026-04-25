@@ -8,32 +8,35 @@ Tavern RS 是 Tavern 的 Rust 重写版本，目标是提供一个面向 CDN/代
 
 - HTTP/1.1、HTTP/2 自动服务端连接，支持 TCP 和 Unix socket 监听。
 - 上游代理，支持 round-robin、random、weighted round-robin 策略。
+- 上游节点权重配置，`upstream.address` 兼容字符串和 `{ address, weight }` 对象写法。
 - GET/HEAD 缓存，TTL 来自 `X-CacheTime` 或 `Cache-Control: max-age=...`。
+- 非 GET/HEAD 请求体完整旁路代理，并标记 `X-Cache: BYPASS`。
+- 旁路响应流式转发，避免非缓存请求收集完整 upstream body。
 - Range 请求缓存，支持分片落盘、部分命中、部分回源、Range 溢出处理。
 - 缓存重验证，支持 `ETag`、`Last-Modified`、`304 Not Modified`。
-- `Vary` 响应缓存索引、fuzzy refresh、collapsed request、prefetch。
+- `Vary` 响应缓存索引、变体落盘索引、fuzzy refresh、collapsed request、prefetch。
+- 后台过期对象 GC，支持批量删除过期对象和 Vary 变体。
 - 存储 bucket：内存 bucket、磁盘 bucket、empty bucket；索引支持 sled、rocksdb、redb、lmdb。
 - 热/冷分层缓存迁移、按命中提升、按年龄降级。
 - 管理接口：`/cache/push`、`PURGE`、健康检查、版本、指标、pprof。
 - 中间件：`caching`、`multirange`、`rewrite`、`recovery`。
-- 插件注册框架和内置 `purge`、`verifier`、`example` 插件。
+- 插件注册框架、内置 `purge`、`verifier`、`example` 插件，以及 C ABI v1 动态库插件加载。
 - 访问日志、加密访问日志、基础日志轮转、优雅升级信号处理。
 - 配置文件变更监听，检测到配置文件修改后触发 graceful reload。
 
-本轮补齐：
+近期补齐：
 
-- `/cache/push` 的 `delete` 和 `expire` 现在会同步处理内存缓存和存储元数据。
+- `/cache/push` 的 `delete` 和 `expire` 会同步处理内存缓存和存储元数据。
 - 单对象 `expire` 不再误删落盘对象，而是将元数据标记为过期。
 - `REVALIDATE_MISS` 会回写存储，避免内存更新后落盘仍保留旧对象。
+- 非 GET/HEAD 请求体旁路代理、不可缓存 GET miss 流式返回。
+- 上游节点权重配置、后台 GC、Vary 变体落盘清理和 C ABI v1 动态插件加载。
 - 新增 `.gitignore`，避免 `target/`、运行时索引和缓存数据进入提交。
 
 仍是后续工作：
 
-- 非 GET/HEAD 请求体的完整代理转发和缓存旁路。
-- 上游响应流式转发；当前实现会把上游响应收集为完整 body。
-- 从配置中解析上游节点权重；目前节点权重固定为 1。
-- 动态插件 ABI/动态库加载；当前是编译期注册内置插件。
-- 后台过期对象 GC、Vary 变体落盘垃圾回收、跨进程共享内存缓存。
+- 可缓存 GET/HEAD 响应的端到端流式写缓存；当前可缓存 miss 仍会收集完整 body 后写入缓存。
+- 跨进程共享内存缓存的真实 mmap/shm 实现；本轮只补充设计边界。
 
 详细分析见 [docs/gap-analysis.md](docs/gap-analysis.md)。
 
@@ -69,9 +72,11 @@ server:
         collapsed_request_wait_timeout: "3s"
 
 upstream:
-  balancing: roundrobin
+  balancing: wrr
   address:
     - "https://origin.example.com"
+    - address: "https://origin-backup.example.com"
+      weight: 3
   max_idle_conns: 1024
   max_idle_conns_per_host: 256
   max_connections_per_server: 512
@@ -83,6 +88,10 @@ storage:
   io_read_limit: 0
   io_write_limit: 0
   io_burst_bytes: 0
+  gc:
+    enabled: true
+    interval_secs: 60
+    batch_size: 1024
   eviction_policy: lru
   selection_policy: hashring
   buckets:
@@ -98,6 +107,13 @@ logger:
   max_size: 256
   max_backups: 7
   compress: true
+
+plugin:
+  - name: purge
+  - name: custom-ffi-plugin
+    library: "/opt/tavern/plugins/libcustom_plugin.so"
+    options:
+      sample: true
 ```
 
 运行：
@@ -111,6 +127,7 @@ cargo run -- -c config.yaml
 ```bash
 curl -x http://127.0.0.1:8080 http://www.example.com/path/file.bin -I
 curl -x http://127.0.0.1:8080 -H "Range: bytes=0-1048575" http://www.example.com/path/file.bin
+curl -x http://127.0.0.1:8080 -X POST --data-binary @payload.json http://api.example.com/v1/jobs
 ```
 
 查看缓存状态：
@@ -182,4 +199,4 @@ cargo test --tests
 cargo test --test range
 ```
 
-更多配置、运维和故障排查见 [docs/usage.md](docs/usage.md)，架构说明见 [docs/design.md](docs/design.md)。
+更多配置、运维和故障排查见 [docs/usage.md](docs/usage.md)，架构说明见 [docs/design.md](docs/design.md)，共享缓存后续方案见 [docs/shared-cache-design.md](docs/shared-cache-design.md)。

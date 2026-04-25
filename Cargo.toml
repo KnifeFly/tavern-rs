@@ -27,6 +27,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "h
 hyper-rustls = { version = "0.26", features = ["http1", "http2", "native-tokio", "ring"] }
 indexmap = "=2.2.6"
 log = "0.4"
+libloading = "0.8"
 md5 = "0.7"
 notify = "6"
 redb = "=2.1.0"

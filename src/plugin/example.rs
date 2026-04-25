@@ -3,10 +3,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use http::{HeaderValue, Response, StatusCode};
-use http_body_util::Full;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::body::{boxed_full, empty_body, ResponseBody};
 use crate::config;
 use crate::plugin::{Plugin, Router};
 use crate::storage;
@@ -155,17 +155,17 @@ fn conv_range(chunks: &crate::storage::object::ChunkSet) -> String {
     ranges.join(",")
 }
 
-fn json_response<T: Serialize>(payload: &T) -> Response<Full<Bytes>> {
+fn json_response<T: Serialize>(payload: &T) -> Response<ResponseBody> {
     match serde_json::to_vec(payload) {
         Ok(body) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("Content-Length", body.len().to_string())
-            .body(Full::new(Bytes::from(body)))
+            .body(boxed_full(Bytes::from(body)))
             .unwrap(),
         Err(_) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::new(Bytes::new()))
+            .body(empty_body())
             .unwrap(),
     }
 }
@@ -173,7 +173,7 @@ fn json_response<T: Serialize>(payload: &T) -> Response<Full<Bytes>> {
 fn json_response_with_opts<T: Serialize>(
     payload: &T,
     opts: &ExampleOptions,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     let mut resp = json_response(payload);
     if !opts.option1.is_empty() {
         if let Ok(val) = HeaderValue::from_str(&opts.option1) {

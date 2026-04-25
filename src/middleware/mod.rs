@@ -3,24 +3,24 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
 use http::{Request, Response};
-use http_body_util::Full;
 use hyper::body::Incoming;
+
+use crate::body::ResponseBody;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub trait RoundTripper: Send + Sync {
-    fn round_trip(&self, req: Request<Incoming>) -> BoxFuture<Result<Response<Full<Bytes>>>>;
+    fn round_trip(&self, req: Request<Incoming>) -> BoxFuture<Result<Response<ResponseBody>>>;
 }
 
 pub struct RoundTripperFn<F>(pub F);
 
 impl<F> RoundTripper for RoundTripperFn<F>
 where
-    F: Fn(Request<Incoming>) -> BoxFuture<Result<Response<Full<Bytes>>>> + Send + Sync,
+    F: Fn(Request<Incoming>) -> BoxFuture<Result<Response<ResponseBody>>> + Send + Sync,
 {
-    fn round_trip(&self, req: Request<Incoming>) -> BoxFuture<Result<Response<Full<Bytes>>>> {
+    fn round_trip(&self, req: Request<Incoming>) -> BoxFuture<Result<Response<ResponseBody>>> {
         (self.0)(req)
     }
 }

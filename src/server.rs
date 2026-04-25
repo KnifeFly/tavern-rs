@@ -10,7 +10,7 @@ use base64::Engine;
 use bytes::Bytes;
 use chrono::Local;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
@@ -25,8 +25,9 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 
 use crate::access_log::{AccessEncryptor, AccessLogger};
+use crate::body::{boxed_full, boxed_incoming, empty_body, ResponseBody};
 use crate::cache::CacheStore;
-use crate::config::{Bootstrap, MiddlewareConfig};
+use crate::config::{Bootstrap, MiddlewareConfig, StorageGc};
 use crate::constants;
 use crate::event::{self, CacheCompletedPayload, EventContext};
 use crate::logging;
@@ -46,6 +47,7 @@ const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 
 pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     let store = storage::native::NativeStorage::new(&cfg.storage)?;
+    let store_for_gc: Arc<dyn storage::Storage> = store.clone();
     storage::set_default(store);
     storage::tiered::init(&cfg.cache_tiers);
 
@@ -91,7 +93,7 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
         Arc::clone(&cache),
         upstream.clone(),
         Arc::clone(&proxy),
-        cfg.upstream.address.clone(),
+        cfg.upstream.address_strings(),
         Arc::clone(&cache_completed_pub),
         cache_cfg.chunk_size,
         cache_cfg.include_query,
@@ -119,6 +121,7 @@ pub async fn run(cfg: Arc<Bootstrap>) -> Result<()> {
     let inherited = inherited_listener(&addr);
     let (listener, meta) = bind_listener(&addr, inherited)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    spawn_storage_gc(store_for_gc, &state.cfg.storage.gc, shutdown_rx.clone());
     spawn_signal_handlers(meta, Arc::clone(&state.cfg), shutdown_tx);
     notify_ready();
     let result = match listener {
@@ -294,7 +297,9 @@ fn build_plugin_router(plugins: &[Arc<dyn Plugin>]) -> Arc<Router> {
 
 async fn build_upstream_nodes(cfg: &Bootstrap) -> Vec<Node> {
     let mut nodes = Vec::new();
-    for addr in &cfg.upstream.address {
+    for upstream_addr in &cfg.upstream.address {
+        let addr = upstream_addr.address();
+        let weight = upstream_addr.weight();
         if addr.trim().is_empty() {
             continue;
         }
@@ -303,24 +308,24 @@ async fn build_upstream_nodes(cfg: &Bootstrap) -> Vec<Node> {
                 let scheme = uri.scheme_str().unwrap_or("http");
                 if let Some(authority) = uri.authority() {
                     if cfg.upstream.resolve_addresses && scheme != "unix" {
-                        nodes.extend(resolve_nodes(scheme, authority.as_str()).await);
+                        nodes.extend(resolve_nodes(scheme, authority.as_str(), weight).await);
                     } else {
-                        nodes.push(Node::new(scheme, authority.as_str(), 1));
+                        nodes.push(Node::new(scheme, authority.as_str(), weight));
                     }
                     continue;
                 }
             }
         }
         if cfg.upstream.resolve_addresses {
-            nodes.extend(resolve_nodes("http", addr).await);
+            nodes.extend(resolve_nodes("http", addr, weight).await);
         } else {
-            nodes.push(Node::new("http", addr, 1));
+            nodes.push(Node::new("http", addr, weight));
         }
     }
     nodes
 }
 
-async fn resolve_nodes(scheme: &str, authority: &str) -> Vec<Node> {
+async fn resolve_nodes(scheme: &str, authority: &str, weight: usize) -> Vec<Node> {
     let mut out = Vec::new();
     let host_port = if authority.contains(':') {
         authority.to_string()
@@ -330,10 +335,10 @@ async fn resolve_nodes(scheme: &str, authority: &str) -> Vec<Node> {
     match lookup_host(host_port).await {
         Ok(addrs) => {
             for addr in addrs {
-                out.push(Node::new(scheme, &addr.to_string(), 1));
+                out.push(Node::new(scheme, &addr.to_string(), weight));
             }
         }
-        Err(_) => out.push(Node::new(scheme, authority, 1)),
+        Err(_) => out.push(Node::new(scheme, authority, weight)),
     }
     out
 }
@@ -348,20 +353,28 @@ impl RoundTripper for UpstreamRoundTripper {
     fn round_trip(
         &self,
         req: Request<Incoming>,
-    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    ) -> crate::middleware::BoxFuture<Result<Response<ResponseBody>>> {
         let upstream = self.upstream.clone();
         let proxy = Arc::clone(&self.proxy);
         let upstream_addrs = self.upstream_addrs.clone();
         Box::pin(async move {
+            let (parts, body) = req.into_parts();
             let upstream_addr =
-                select_upstream_addr_from_headers(req.headers(), &proxy, &upstream_addrs)?;
-            let uri = build_upstream_uri(&req, &upstream_addr)?;
+                select_upstream_addr_from_headers(&parts.headers, &proxy, &upstream_addrs)?;
+            let uri = build_upstream_uri_from_parts(&parts.uri, &upstream_addr)?;
             let mut headers = HeaderMap::new();
-            copy_headers(req.headers(), &mut headers);
+            copy_headers(&parts.headers, &mut headers);
             headers.remove(constants::INTERNAL_UPSTREAM_ADDR);
-            let (status, headers, body) =
-                upstream.fetch(req.method().clone(), uri, headers).await?;
-            Ok(response_with_headers(status, headers, body))
+            let resp = upstream
+                .stream(parts.method, uri, headers, boxed_incoming(body))
+                .await?;
+            let status = resp.status();
+            let headers = strip_hop_headers(resp.headers());
+            Ok(stream_response_with_headers(
+                status,
+                headers,
+                boxed_incoming(resp.into_body()),
+            ))
         })
     }
 }
@@ -385,17 +398,13 @@ fn select_upstream_addr_from_headers(
         .ok_or_else(|| anyhow!("upstream.address is empty"))
 }
 
-fn build_upstream_uri(req: &Request<Incoming>, addr: &str) -> Result<http::Uri> {
+fn build_upstream_uri_from_parts(uri: &http::Uri, addr: &str) -> Result<http::Uri> {
     let base = if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
     } else {
         format!("http://{}", addr)
     };
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let full = format!("{}{}", base, path);
     full.parse::<http::Uri>().context("parse upstream uri")
 }
@@ -521,6 +530,37 @@ fn bind_listener(
         addr: bind_addr,
     };
     Ok((ListenerKind::Tcp(tokio_listener), meta))
+}
+
+fn spawn_storage_gc(
+    store: Arc<dyn storage::Storage>,
+    cfg: &StorageGc,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    if !cfg.enabled {
+        return;
+    }
+    let interval_secs = cfg.interval_secs.max(1);
+    let batch_size = cfg.batch_size;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = ticker.tick() => {
+                    match store.gc_expired(batch_size) {
+                        Ok(removed) if removed > 0 => {
+                            log::info!("storage gc removed {removed} expired objects");
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            log::warn!("storage gc failed: {err}");
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn spawn_signal_handlers(meta: ListenerMeta, cfg: Arc<Bootstrap>, shutdown: watch::Sender<bool>) {
@@ -728,7 +768,7 @@ async fn serve_with_timeout<I, S>(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
-    S: hyper::service::Service<Request<Incoming>, Response = Response<Full<Bytes>>> + 'static,
+    S: hyper::service::Service<Request<Incoming>, Response = Response<ResponseBody>> + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
@@ -759,7 +799,7 @@ fn conn_timeout(cfg: &crate::config::Server) -> Option<Duration> {
 async fn handle(
     req: Request<Incoming>,
     state: Arc<AppState>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ResponseBody>, hyper::Error> {
     let req_info = RequestInfo::from_request(&req);
     let host = extract_host(&req);
     let is_local = host
@@ -795,7 +835,7 @@ async fn handle(
     Ok(resp)
 }
 
-async fn handle_internal(req: Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
+async fn handle_internal(req: Request<Incoming>, state: &AppState) -> Response<ResponseBody> {
     let path = req.uri().path().to_string();
     if path.starts_with("/debug/pprof") {
         return handle_pprof(req, state).await;
@@ -816,7 +856,7 @@ async fn handle_internal(req: Request<Incoming>, state: &AppState) -> Response<F
     }
 }
 
-async fn handle_proxy(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<Bytes>> {
+async fn handle_proxy(req: Request<Incoming>, state: Arc<AppState>) -> Response<ResponseBody> {
     for plugin in &state.plugins {
         if let Some(resp) = plugin.handle_request(&req) {
             return resp;
@@ -832,7 +872,7 @@ async fn handle_proxy(req: Request<Incoming>, state: Arc<AppState>) -> Response<
     }
 }
 
-async fn handle_purge(req: &Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
+async fn handle_purge(req: &Request<Incoming>, state: &AppState) -> Response<ResponseBody> {
     let cache_key = match build_cache_key(req, state.cache_include_query) {
         Some(key) => key,
         None => return text_response(StatusCode::BAD_REQUEST, "invalid host"),
@@ -850,7 +890,7 @@ async fn handle_purge(req: &Request<Incoming>, state: &AppState) -> Response<Ful
         state.cache.remove_key_and_variants(&cache_key).await > 0
     };
     let _ = storage::current().purge(
-        req.uri().to_string().as_str(),
+        &cache_key,
         storage::PurgeControl {
             hard: true,
             dir,
@@ -973,62 +1013,58 @@ impl RequestInfo {
     }
 }
 
-fn not_found() -> Response<Full<Bytes>> {
+fn not_found() -> Response<ResponseBody> {
     text_response(StatusCode::NOT_FOUND, "not found")
 }
 
-fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+fn empty_response(status: StatusCode) -> Response<ResponseBody> {
     metrics::record(status);
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::new()))
+        .body(empty_body())
         .unwrap()
 }
 
-fn response_with_headers(
+fn stream_response_with_headers(
     status: StatusCode,
     headers: HeaderMap,
-    body: Bytes,
-) -> Response<Full<Bytes>> {
+    body: ResponseBody,
+) -> Response<ResponseBody> {
     metrics::record(status);
     let mut builder = Response::builder().status(status);
     for (k, v) in headers.iter() {
         builder = builder.header(k, v);
     }
-    builder.body(Full::new(body)).unwrap()
+    builder.body(body).unwrap()
 }
 
-fn empty_with_headers(status: StatusCode, headers: HeaderMap) -> Response<Full<Bytes>> {
-    response_with_headers(status, headers, Bytes::new())
-}
-
-fn text_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+fn text_response(status: StatusCode, body: &str) -> Response<ResponseBody> {
     metrics::record(status);
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(boxed_full(Bytes::from(body.to_string())))
         .unwrap()
 }
 
-fn json_response<T: serde::Serialize>(payload: &T) -> Response<Full<Bytes>> {
+fn json_response<T: serde::Serialize>(payload: &T) -> Response<ResponseBody> {
     match serde_json::to_vec(payload) {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json; charset=utf-8")
-            .body(Full::new(Bytes::from(bytes)))
+            .body(boxed_full(Bytes::from(bytes)))
             .unwrap(),
         Err(_) => text_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to encode"),
     }
 }
 
 #[allow(dead_code)]
-fn invalid_request(msg: &str) -> Response<Full<Bytes>> {
+fn invalid_request(msg: &str) -> Response<ResponseBody> {
     text_response(StatusCode::BAD_REQUEST, msg)
 }
 
 #[allow(dead_code)]
-fn internal_error(err: &dyn std::error::Error) -> Response<Full<Bytes>> {
+fn internal_error(err: &dyn std::error::Error) -> Response<ResponseBody> {
     let body = format!("internal error: {err}");
     text_response(StatusCode::INTERNAL_SERVER_ERROR, &body)
 }
@@ -1038,7 +1074,7 @@ fn _ensure_send_sync() {
     assert_send_sync::<Bootstrap>();
 }
 
-fn log_access(state: &AppState, req: &RequestInfo, resp: &Response<Full<Bytes>>) {
+fn log_access(state: &AppState, req: &RequestInfo, resp: &Response<ResponseBody>) {
     let logger = match &state.access_logger {
         Some(logger) => logger,
         None => return,
@@ -1112,6 +1148,31 @@ fn response_header_size(status: StatusCode, headers: &HeaderMap) -> u64 {
     n + 2
 }
 
+fn strip_hop_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (k, v) in headers.iter() {
+        if is_hop_header(k.as_str()) {
+            continue;
+        }
+        out.insert(k, v.clone());
+    }
+    out
+}
+
+fn is_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
 fn client_ip(remote_addr: &str, headers: &HeaderMap) -> String {
     let direct = headers
         .get("Client-Ip")
@@ -1121,7 +1182,7 @@ fn client_ip(remote_addr: &str, headers: &HeaderMap) -> String {
     direct.unwrap_or(remote_addr).to_string()
 }
 
-async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
+async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<ResponseBody> {
     let (user, pass) = match &state.pprof_auth {
         Some(val) => val,
         None => return not_found(),
@@ -1133,7 +1194,7 @@ async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full
                 "WWW-Authenticate",
                 r#"Basic realm="restricted", charset="UTF-8""#,
             )
-            .body(Full::new(Bytes::from("Unauthorized")))
+            .body(boxed_full(Bytes::from("Unauthorized")))
             .unwrap();
     }
     let path = req.uri().path();
@@ -1143,7 +1204,7 @@ async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; charset=utf-8")
             .header("Content-Length", body.len().to_string())
-            .body(Full::new(Bytes::from(body)))
+            .body(boxed_full(Bytes::from(body)))
             .unwrap();
     }
 
@@ -1154,7 +1215,7 @@ async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; charset=utf-8")
             .header("Content-Length", out.len().to_string())
-            .body(Full::new(Bytes::from(out)))
+            .body(boxed_full(Bytes::from(out)))
             .unwrap();
     }
 
@@ -1212,7 +1273,7 @@ async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full
             .status(StatusCode::OK)
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", body.len().to_string())
-            .body(Full::new(Bytes::from(body)))
+            .body(boxed_full(Bytes::from(body)))
             .unwrap();
     }
 
@@ -1245,7 +1306,7 @@ async fn handle_pprof(req: Request<Incoming>, state: &AppState) -> Response<Full
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; charset=utf-8")
             .header("Content-Length", out.len().to_string())
-            .body(Full::new(Bytes::from(out)))
+            .body(boxed_full(Bytes::from(out)))
             .unwrap();
     }
 

@@ -82,6 +82,9 @@ pub trait Storage: Send + Sync {
     fn shared_kv(&self) -> Arc<dyn SharedKV>;
     fn selector(&self) -> Arc<dyn Selector>;
     fn purge(&self, store_url: &str, control: PurgeControl) -> Result<()>;
+    fn gc_expired(&self, _batch_size: usize) -> Result<usize> {
+        Ok(0)
+    }
     fn bucket_by_id(&self, _id: &str) -> Option<Arc<dyn Bucket>> {
         None
     }
@@ -215,7 +218,10 @@ pub fn set_io_limits(cfg: &config::Storage) {
 pub fn rate_limit_reader(reader: BoxedReader) -> BoxedReader {
     let limiter = IO_LIMITER.get().and_then(|l| l.read.as_ref().cloned());
     if let Some(limiter) = limiter {
-        Box::new(RateLimitedReader { inner: reader, limiter })
+        Box::new(RateLimitedReader {
+            inner: reader,
+            limiter,
+        })
     } else {
         reader
     }
@@ -224,7 +230,10 @@ pub fn rate_limit_reader(reader: BoxedReader) -> BoxedReader {
 pub fn rate_limit_writer(writer: BoxedWriter) -> BoxedWriter {
     let limiter = IO_LIMITER.get().and_then(|l| l.write.as_ref().cloned());
     if let Some(limiter) = limiter {
-        Box::new(RateLimitedWriter { inner: writer, limiter })
+        Box::new(RateLimitedWriter {
+            inner: writer,
+            limiter,
+        })
     } else {
         writer
     }
@@ -369,4 +378,39 @@ pub fn current() -> Arc<dyn Storage> {
         .get()
         .expect("storage not initialized")
         .clone()
+}
+
+pub fn vary_index_key(base_key: &str) -> String {
+    format!("vary/{base_key}")
+}
+
+pub fn read_vary_variants(kv: &dyn SharedKV, base_key: &str) -> Vec<String> {
+    let key = vary_index_key(base_key);
+    kv.get(key.as_bytes())
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn add_vary_variant(kv: &dyn SharedKV, base_key: &str, variant_key: &str) -> Result<()> {
+    let key = vary_index_key(base_key);
+    let mut variants = read_vary_variants(kv, base_key);
+    if !variants.iter().any(|item| item == variant_key) {
+        variants.push(variant_key.to_string());
+        variants.sort();
+    }
+    let raw = serde_json::to_vec(&variants)?;
+    kv.set(key.as_bytes(), &raw)
+}
+
+pub fn remove_vary_variant(kv: &dyn SharedKV, base_key: &str, variant_key: &str) -> Result<()> {
+    let key = vary_index_key(base_key);
+    let mut variants = read_vary_variants(kv, base_key);
+    variants.retain(|item| item != variant_key);
+    if variants.is_empty() {
+        kv.delete(key.as_bytes())
+    } else {
+        let raw = serde_json::to_vec(&variants)?;
+        kv.set(key.as_bytes(), &raw)
+    }
 }

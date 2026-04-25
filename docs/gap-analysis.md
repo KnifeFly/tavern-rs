@@ -8,21 +8,78 @@
 | --- | --- | --- |
 | HTTP 服务 | 已实现 | TCP/Unix socket、HTTP/1.1/HTTP/2、基础超时、优雅升级。 |
 | 上游代理 | 已实现 | HTTP/HTTPS 上游、连接池、每上游连接限制、TLS 校验开关。 |
-| 负载均衡 | 部分实现 | round-robin、random、weighted round-robin 逻辑存在，但配置没有解析节点权重。 |
+| 负载均衡 | 已实现 | round-robin、random、weighted round-robin；配置支持节点权重。 |
 | GET/HEAD 缓存 | 已实现 | TTL、内存缓存、落盘存储、HEAD 空 body 返回。 |
 | Range 缓存 | 已实现 | 单 Range 解析、分片、部分命中、溢出处理、回源填充。 |
 | 多 Range | 部分实现 | 可合并第一段或拼 multipart 响应；没有和缓存层深度协同。 |
 | 重验证 | 已实现 | ETag/Last-Modified/304；本轮补齐 revalidate miss 回写 storage。 |
-| Vary | 部分实现 | 内存 vary index 和 vary key 已实现；落盘变体垃圾回收仍不完整。 |
+| Vary | 已实现 | 内存 vary index、vary key、落盘变体索引和 GC 清理。 |
 | 缓存管理 | 已实现 | `PURGE`、`/cache/push` prefetch/expire/delete；本轮补齐内存缓存同步。 |
 | 存储 | 已实现 | memory/disk/empty bucket，sled/rocksdb/redb/lmdb 索引。 |
 | 热冷分层 | 已实现 | 提升、降级、write-through、迁移队列和指标。 |
 | 指标 | 已实现 | Prometheus 文本指标。 |
 | 访问日志 | 已实现 | 文件/stdout、分钟轮转、可选 AES-GCM 行加密。 |
-| 插件 | 部分实现 | 编译期注册内置插件；未实现动态插件加载。 |
+| 插件 | 已实现 | 编译期注册内置插件；支持 C ABI v1 动态库加载。 |
 | 文档 | 本轮补齐 | README、设计文档、使用文档和缺口分析。 |
 
 ## 本轮修复的缺口
+
+### 非 GET/HEAD 请求体旁路代理
+
+原行为：
+
+- caching 中间件只允许 GET/HEAD。
+- upstream client 构造请求时 body 总是空。
+
+修复：
+
+- 非 GET/HEAD 请求直接绕过缓存读写，调用后续 round tripper。
+- 原始 request body 以 stream 形式转发给 upstream。
+- 响应标记 `X-Cache: BYPASS`。
+
+### 旁路响应流式转发
+
+原行为：
+
+- 代理回源响应统一通过 `BodyExt::collect()` 读完整 body。
+
+修复：
+
+- 服务响应体统一为 boxed body。
+- 旁路响应直接转发 upstream `Incoming` body。
+- 可缓存 GET/HEAD miss 仍保留完整 collect，用于维持现有缓存写入逻辑。
+
+### 上游权重配置
+
+修复：
+
+- `upstream.address` 兼容字符串和 `{ address, weight }` 写法。
+- `weight` 默认 1，0 会启动失败。
+- DNS resolve 后的节点继承配置权重。
+
+### 后台 GC 和 Vary 落盘清理
+
+修复：
+
+- 新增 `storage.gc.enabled`、`interval_secs`、`batch_size`。
+- native storage 实现 `gc_expired`。
+- Vary 变体写入 `SharedKV` 辅助索引 `vary/{base_key}`。
+- purge 和 GC 会同步删除 base key、variant、目录索引和 vary 索引。
+
+### 动态插件 ABI
+
+修复：
+
+- 新增 `plugin[].library`。
+- 动态库通过 `tavern_plugin_create_v1` 暴露 C ABI v1。
+- 宿主保存 dynamic library handle，使用 JSON 交换配置和请求/响应元数据。
+
+### 共享缓存设计
+
+修复：
+
+- 新增 `docs/shared-cache-design.md`。
+- 明确共享缓存的 trait、元数据、一致性、锁和崩溃恢复边界。
 
 ### `/cache/push` 未同步内存缓存
 
@@ -78,95 +135,44 @@
 
 ## 后续优先级建议
 
-### P0：请求体代理
+### P0：可缓存响应流式写缓存
 
 现状：
 
-- caching 中间件只允许 GET/HEAD。
-- upstream client 构造请求时 body 总是空。
+- 非缓存/旁路响应已经流式转发。
+- 可缓存 GET/HEAD miss 仍通过 `BodyExt::collect()` 一次性读入内存。
 
 影响：
 
-- 不能作为通用 HTTP 反向代理处理 POST/PUT/PATCH。
+- 超大可缓存对象和慢连接场景内存压力仍然较高。
 
 建议：
 
-- 在 caching 前增加明确 bypass 逻辑。
-- `UpstreamClient::fetch` 支持传入 body stream 或 bytes。
-- 对非缓存方法只代理，不进入缓存写路径。
-
-### P0：流式响应
-
-现状：
-
-- 回源响应通过 `BodyExt::collect()` 一次性读入内存。
-
-影响：
-
-- 超大对象和慢连接场景内存压力高。
-
-建议：
-
-- 拆分响应转发和缓存写入。
-- 非缓存响应直接流式转发。
 - 可缓存响应采用边读边写 chunk，并向客户端流式输出。
 
-### P1：上游权重配置
+### P1：动态插件能力扩展
 
 现状：
 
-- `Node::weight` 支持权重。
-- `build_upstream_nodes` 创建节点时权重固定为 1。
+- C ABI 插件可以处理请求元数据并返回响应。
+- 当前不读取请求 body，也不注册本地管理路由。
 
 建议：
 
-- 支持配置：
+- 增加异步 body 读取/流式回调模型。
+- 设计动态插件路由注册 ABI。
 
-```yaml
-upstream:
-  address:
-    - url: "http://origin-a"
-      weight: 3
-    - url: "http://origin-b"
-      weight: 1
-```
-
-或在保持兼容的前提下新增 `nodes` 字段。
-
-### P1：Vary 变体落盘 GC
+### P1：共享内存缓存实现
 
 现状：
 
-- 内存删除会删除 `{base_key}` 和 `{base_key}#vary:*`。
-- storage 单对象删除只按精确 key 删除。
+- 已有设计文档和接口边界。
+- 尚未实现 mmap/shm 数据结构。
 
 建议：
 
-- 在 SharedKV 中为 vary base 建立变体索引。
-- delete/expire/purge 时遍历变体索引并清理 storage。
-
-### P1：后台过期对象清理
-
-现状：
-
-- 过期对象在访问、purge 或迁移时被动处理。
-
-建议：
-
-- 增加 storage GC loop。
-- 使用 `IndexDB::expired` 扫描过期 metadata。
-- 控制 batch、间隔和 IO 速率。
-
-### P2：插件动态加载
-
-现状：
-
-- 插件通过 Rust 代码注册到全局 registry。
-
-建议：
-
-- 先稳定插件 trait 和路由能力。
-- 再评估动态库 ABI 或 WASM 插件模型。
+- 先落地纯内存 mock L2。
+- 再实现 mmap metadata、小对象 body 和崩溃恢复。
 
 ### P2：配置 schema 和示例
 
@@ -194,3 +200,8 @@ upstream:
 
 - `/cache/push` delete 删除内存缓存后能重新回源。
 - `/cache/push` expire 标记内存缓存过期后能触发 `REVALIDATE_MISS`。
+- 非 GET/HEAD body 原样转发且不写缓存。
+- 旁路响应首段 body 可在 upstream 完成前返回。
+- 上游权重配置解析和 weighted round-robin 分布。
+- storage GC 删除过期 Vary base 和 variant。
+- 动态插件加载成功、缺失 symbol、ABI mismatch。

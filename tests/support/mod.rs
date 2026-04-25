@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,10 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use rand::RngCore;
-use tavern::config::{Bootstrap, CacheTiers, Logger, MiddlewareConfig, Server, Storage, Upstream};
+use tavern::config::{
+    Bootstrap, CacheTiers, Logger, MiddlewareConfig, Server, Storage, StorageGc, Upstream,
+    UpstreamAddress,
+};
 use tavern::constants;
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
@@ -73,7 +77,7 @@ fn test_config() -> Bootstrap {
         plugin: Vec::new(),
         upstream: Upstream {
             balancing: "wrr".to_string(),
-            address: vec!["http://127.0.0.1:1".to_string()],
+            address: vec![UpstreamAddress::from("http://127.0.0.1:1")],
             max_idle_conns: 1000,
             max_idle_conns_per_host: 500,
             max_connections_per_server: 100,
@@ -92,6 +96,7 @@ fn test_config() -> Bootstrap {
             io_read_limit: 0,
             io_write_limit: 0,
             io_burst_bytes: 0,
+            gc: StorageGc::default(),
             buckets: Vec::new(),
         },
         cache_tiers: CacheTiers::default(),
@@ -218,6 +223,43 @@ impl MockServer {
         }
     }
 
+    pub async fn start_async<F, Fut>(handler: F) -> Self
+    where
+        F: Fn(http::Request<Incoming>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown, mut rx) = tokio::sync::oneshot::channel();
+        let handler = Arc::new(handler);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    res = listener.accept() => {
+                        let (stream, _) = match res { Ok(v) => v, Err(_) => break };
+                        let io = TokioIo::new(stream);
+                        let handler = Arc::clone(&handler);
+                        tokio::spawn(async move {
+                            let service = service_fn(move |req| {
+                                let fut = handler(req);
+                                async move { Ok::<_, hyper::Error>(fut.await) }
+                            });
+                            let builder = ConnBuilder::new(TokioExecutor::new());
+                            let _ = builder.serve_connection(io, service).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        Self {
+            addr,
+            shutdown: Some(shutdown),
+        }
+    }
+
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -280,6 +322,21 @@ impl E2E {
     {
         ensure_server().await;
         let upstream = MockServer::start(handler).await;
+        let client = TestClient::new("http://127.0.0.1:18080");
+        Self {
+            case_url: case_url.to_string(),
+            upstream,
+            client,
+        }
+    }
+
+    pub async fn new_async<F, Fut>(case_url: &str, handler: F) -> Self
+    where
+        F: Fn(http::Request<Incoming>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+    {
+        ensure_server().await;
+        let upstream = MockServer::start_async(handler).await;
         let client = TestClient::new("http://127.0.0.1:18080");
         Self {
             case_url: case_url.to_string(),

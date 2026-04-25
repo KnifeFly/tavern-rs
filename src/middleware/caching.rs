@@ -7,10 +7,11 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use http::header::HOST;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use rand::Rng;
 
+use crate::body::{boxed_full, boxed_incoming, empty_body, ResponseBody};
 use crate::cache::{CacheEntry, CacheStatus, CacheStore};
 use crate::config::MiddlewareConfig;
 use crate::constants;
@@ -244,7 +245,7 @@ impl RoundTripper for CachingMiddleware {
     fn round_trip(
         &self,
         req: Request<Incoming>,
-    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    ) -> crate::middleware::BoxFuture<Result<Response<ResponseBody>>> {
         let next = Arc::clone(&self.next);
         let _opts = self.opts.clone();
         Box::pin(async move { next.round_trip(req).await })
@@ -261,7 +262,7 @@ impl RoundTripper for CachingMiddlewareWithState {
     fn round_trip(
         &self,
         req: Request<Incoming>,
-    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    ) -> crate::middleware::BoxFuture<Result<Response<ResponseBody>>> {
         let next = Arc::clone(&self.next);
         let state = Arc::clone(&self.state);
         let opts = self.opts.clone();
@@ -271,18 +272,20 @@ impl RoundTripper for CachingMiddlewareWithState {
 
 async fn handle_request(
     req: Request<Incoming>,
-    _next: Arc<dyn RoundTripper>,
+    next: Arc<dyn RoundTripper>,
     state: Arc<CachingState>,
     opts: CachingOptions,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ResponseBody>> {
     let cfg = Config::from_options(&state, &opts);
     touch_object_pool_config(&cfg);
     let method = req.method().clone();
     if method != Method::GET && method != Method::HEAD {
-        return Ok(text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed",
-        ));
+        let mut resp = next.round_trip(req).await?;
+        resp.headers_mut().insert(
+            constants::PROTOCOL_CACHE_STATUS_KEY,
+            "BYPASS".parse().unwrap(),
+        );
+        return Ok(resp);
     }
 
     let base_key =
@@ -367,14 +370,67 @@ async fn handle_cache_miss(
     cache_key: &str,
     range_header: Option<&str>,
     prefetch: bool,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
+    let mut streamed_upstream = None;
+    if should_probe_streaming_miss(req, cfg, range_header, prefetch) {
+        match fetch_upstream_stream(req, &state).await {
+            Ok(resp) => {
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let ttl = cache_ttl(&headers);
+                if !is_cacheable(status, &headers, ttl) {
+                    let mut response_headers = strip_hop_headers(headers);
+                    response_headers.insert(
+                        constants::PROTOCOL_CACHE_STATUS_KEY,
+                        "BYPASS".parse().unwrap(),
+                    );
+                    return stream_response_with_headers(
+                        status,
+                        response_headers,
+                        boxed_incoming(resp.into_body()),
+                    );
+                }
+                match resp.into_body().collect().await {
+                    Ok(body) => {
+                        streamed_upstream = Some(UpstreamOutcome {
+                            ok: true,
+                            status,
+                            headers,
+                            body: body.to_bytes(),
+                        });
+                    }
+                    Err(err) => {
+                        log::warn!("upstream streaming miss collect failed: {err}");
+                        streamed_upstream = Some(UpstreamOutcome {
+                            ok: false,
+                            status: StatusCode::BAD_GATEWAY,
+                            headers: HeaderMap::new(),
+                            body: Bytes::new(),
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!("upstream streaming miss failed: {err}");
+                streamed_upstream = Some(UpstreamOutcome {
+                    ok: false,
+                    status: StatusCode::BAD_GATEWAY,
+                    headers: HeaderMap::new(),
+                    body: Bytes::new(),
+                });
+            }
+        }
+    }
+
     let mut snapshot = snapshot_request(req);
     snapshot.headers.remove(constants::PREFETCH_CACHE_KEY);
     if prefetch {
         snapshot.headers.remove("Range");
     }
     let keep_range = range_header.is_some() && !prefetch;
-    let upstream = if cfg.collapsed_request {
+    let upstream = if let Some(upstream) = streamed_upstream {
+        upstream
+    } else if cfg.collapsed_request {
         let cache_key = cache_key.to_string();
         if cfg.collapsed_timeout > Duration::from_millis(0) {
             let cfg_timeout = cfg.clone();
@@ -732,7 +788,7 @@ async fn handle_cache_hit(
     cache_key: &str,
     entry: CacheEntry,
     range_header: Option<&str>,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     let mut status = CacheStatus::Hit;
     let range = parse_range_header(range_header, entry.size);
     let has_full_body = entry.body.len() as u64 == entry.size || entry.size == 0;
@@ -940,7 +996,7 @@ fn serve_storage_range(
     entry: &CacheEntry,
     range: RangeSpec,
     status: CacheStatus,
-) -> Option<Response<Full<Bytes>>> {
+) -> Option<Response<ResponseBody>> {
     let id = Id::new(cache_key);
     let storage = storage::current();
     let mut bucket = storage.select_hot(&id);
@@ -1029,7 +1085,7 @@ async fn fetch_range_and_store(
     entry: &CacheEntry,
     raw_range: RangeSpec,
     cache_status: CacheStatus,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     let filled = fill_range_spec(
         raw_range,
         entry.size,
@@ -1153,7 +1209,7 @@ async fn handle_storage_hit(
     _state: &CachingState,
     cache_key: &str,
     range_header: Option<&str>,
-) -> Option<Response<Full<Bytes>>> {
+) -> Option<Response<ResponseBody>> {
     let id = Id::new(cache_key);
     let storage = storage::current();
     let mut bucket = storage.select_hot(&id);
@@ -1196,7 +1252,7 @@ async fn handle_revalidate(
     cache_key: &str,
     entry: CacheEntry,
     range_header: Option<&str>,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     let mut conditional = HeaderMap::new();
     if let Some(etag) = &entry.etag {
         conditional.insert("If-None-Match", etag.parse().unwrap());
@@ -1335,7 +1391,7 @@ fn serve_cached_with_status(
     entry: CacheEntry,
     status: CacheStatus,
     range_header: Option<&str>,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     let mut headers = entry.headers.clone();
     headers.insert(
         constants::PROTOCOL_CACHE_STATUS_KEY,
@@ -1354,6 +1410,31 @@ fn serve_cached_with_status(
         return empty_with_headers(resp_status, headers);
     }
     response_with_headers(resp_status, headers, resp_body)
+}
+
+fn should_probe_streaming_miss(
+    req: &Request<Incoming>,
+    cfg: &Config,
+    range_header: Option<&str>,
+    prefetch: bool,
+) -> bool {
+    req.method() == Method::GET && range_header.is_none() && !prefetch && !cfg.collapsed_request
+}
+
+async fn fetch_upstream_stream(
+    req: &Request<Incoming>,
+    state: &CachingState,
+) -> Result<http::Response<Incoming>> {
+    let upstream_addr = select_upstream_addr(req, state)?;
+    let uri = build_upstream_uri(req, &upstream_addr)?;
+    let mut headers = HeaderMap::new();
+    copy_headers(req.headers(), &mut headers);
+    headers.remove(constants::INTERNAL_UPSTREAM_ADDR);
+    headers.remove("Range");
+    state
+        .upstream
+        .stream(req.method().clone(), uri, headers, empty_body())
+        .await
 }
 
 async fn fetch_upstream_full(
@@ -1885,6 +1966,13 @@ fn store_to_storage(
     let mut first_path = None;
     let now = storage::unix_now();
     let expires_at = ttl.map(|d| now + d.as_secs() as i64).unwrap_or(0);
+    let mut flags = CacheFlag::CACHE;
+    let mut virtual_key = Vec::new();
+    if let Some((base_key, _)) = cache_key.split_once("#vary:") {
+        flags = CacheFlag::VARY_CACHE;
+        virtual_key.push(base_key.to_string());
+        let _ = storage::add_vary_variant(storage.shared_kv().as_ref(), base_key, cache_key);
+    }
     let mut header_pairs = Vec::new();
     let mut has_length = false;
     for (k, v) in headers.iter() {
@@ -1900,7 +1988,7 @@ fn store_to_storage(
     }
 
     let mut meta = Metadata {
-        flags: CacheFlag::CACHE,
+        flags,
         id: id.clone(),
         block_size: chunk_size,
         chunks: ChunkSet::default(),
@@ -1912,7 +2000,7 @@ fn store_to_storage(
         refs: 1,
         expires_at,
         headers: header_pairs,
-        virtual_key: Vec::new(),
+        virtual_key,
     };
 
     if body_size > 0 {
@@ -2023,24 +2111,32 @@ fn response_with_headers(
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
+    stream_response_with_headers(status, headers, boxed_full(body))
+}
+
+fn stream_response_with_headers(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: ResponseBody,
+) -> Response<ResponseBody> {
     metrics::record(status);
     let mut builder = Response::builder().status(status);
     for (k, v) in headers.iter() {
         builder = builder.header(k, v);
     }
-    builder.body(Full::new(body)).unwrap()
+    builder.body(body).unwrap()
 }
 
-fn empty_with_headers(status: StatusCode, headers: HeaderMap) -> Response<Full<Bytes>> {
+fn empty_with_headers(status: StatusCode, headers: HeaderMap) -> Response<ResponseBody> {
     response_with_headers(status, headers, Bytes::new())
 }
 
-fn text_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+fn text_response(status: StatusCode, body: &str) -> Response<ResponseBody> {
     metrics::record(status);
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(boxed_full(Bytes::from(body.to_string())))
         .unwrap()
 }

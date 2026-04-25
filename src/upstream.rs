@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -12,11 +12,12 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::body::{empty_body, ResponseBody};
 use crate::config;
 
 #[derive(Clone)]
 pub struct UpstreamClient {
-    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: Client<HttpsConnector<HttpConnector>, ResponseBody>,
     max_conns_per_host: Option<usize>,
     host_limits: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     fd_limit: Option<Arc<Semaphore>>,
@@ -86,14 +87,29 @@ impl UpstreamClient {
         for (k, v) in headers.iter() {
             req = req.header(k, v);
         }
-        let req = req
-            .body(Full::new(Bytes::new()))
-            .context("build upstream request")?;
+        let req = req.body(empty_body()).context("build upstream request")?;
         let resp = self.client.request(req).await.context("upstream request")?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let body_bytes = collect_body(resp).await?;
         Ok((status, headers, body_bytes))
+    }
+
+    pub async fn stream(
+        &self,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: ResponseBody,
+    ) -> Result<http::Response<Incoming>> {
+        let _fd_permit = self.acquire_fd_limit().await;
+        let _host_permit = self.acquire_host_limit(&uri).await;
+        let mut req = http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers.iter() {
+            req = req.header(k, v);
+        }
+        let req = req.body(body).context("build upstream request")?;
+        self.client.request(req).await.context("upstream request")
     }
 
     async fn acquire_host_limit(&self, uri: &Uri) -> Option<OwnedSemaphorePermit> {

@@ -6,10 +6,10 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::FutureExt;
 use http::{Request, Response, StatusCode};
-use http_body_util::Full;
 use hyper::body::Incoming;
 use std::panic::AssertUnwindSafe;
 
+use crate::body::{boxed_full, ResponseBody};
 use crate::config::MiddlewareConfig;
 use crate::middleware::registry::register;
 use crate::middleware::{Cleanup, Middleware, RoundTripper};
@@ -73,7 +73,7 @@ impl RoundTripper for RecoveryMiddleware {
     fn round_trip(
         &self,
         req: Request<Incoming>,
-    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    ) -> crate::middleware::BoxFuture<Result<Response<ResponseBody>>> {
         let next = Arc::clone(&self.next);
         let fail_count = Arc::clone(&self.fail_count);
         let threshold = self.threshold;
@@ -90,7 +90,7 @@ impl RoundTripper for RecoveryMiddleware {
                     }
                     Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("internal server error")))
+                        .body(boxed_full(Bytes::from("internal server error")))
                         .unwrap())
                 }
             }

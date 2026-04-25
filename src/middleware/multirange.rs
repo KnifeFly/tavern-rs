@@ -3,10 +3,10 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
-use http_body_util::Full;
 use hyper::body::Incoming;
 use rand::Rng;
 
+use crate::body::{boxed_full, empty_body, ResponseBody};
 use crate::config::MiddlewareConfig;
 use crate::constants;
 use crate::middleware::registry::register;
@@ -94,7 +94,7 @@ impl RoundTripper for MultirangeMiddleware {
     fn round_trip(
         &self,
         mut req: Request<Incoming>,
-    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    ) -> crate::middleware::BoxFuture<Result<Response<ResponseBody>>> {
         let next = Arc::clone(&self.next);
         let opts = self.opts.clone();
         let state = self.state.clone();
@@ -122,7 +122,7 @@ impl RoundTripper for MultirangeMiddleware {
 async fn handle_multirange(
     req: Request<Incoming>,
     state: Arc<MultirangeState>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ResponseBody>> {
     let raw_range = req
         .headers()
         .get("Range")
@@ -134,7 +134,7 @@ async fn handle_multirange(
             return Ok(Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header("X-Error", err.to_string())
-                .body(Full::new(Bytes::new()))
+                .body(empty_body())
                 .unwrap());
         }
     };
@@ -149,7 +149,7 @@ async fn handle_multirange(
         return Ok(Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header("Content-Range", format!("bytes */{}", obj_size))
-            .body(Full::new(Bytes::new()))
+            .body(empty_body())
             .unwrap());
     }
     if ranges.len() <= 1 {
@@ -185,7 +185,7 @@ async fn handle_multirange(
 
     Ok(Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
-        .body(Full::new(Bytes::from(body)))
+        .body(boxed_full(Bytes::from(body)))
         .unwrap())
 }
 
@@ -216,7 +216,7 @@ async fn fetch_single_range(
     mut req: Request<Incoming>,
     state: &MultirangeState,
     range: Option<RangeSpec>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ResponseBody>> {
     if let Some(range) = range {
         req.headers_mut().insert(
             "Range",
@@ -239,7 +239,7 @@ async fn fetch_single_range(
     for (k, v) in response_headers.iter() {
         builder = builder.header(k, v);
     }
-    Ok(builder.body(Full::new(body)).unwrap())
+    Ok(builder.body(boxed_full(body)).unwrap())
 }
 
 async fn fetch_range_body(

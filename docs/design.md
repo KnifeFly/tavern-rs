@@ -10,9 +10,8 @@ Tavern RS 是一个缓存型反向代理/HTTP 代理。核心目标是：
 
 非目标：
 
-- 当前不做通用 HTTP 网关的完整请求体代理。
-- 当前不做端到端流式缓存；上游响应会被收集为完整 body 后处理。
-- 当前不提供动态插件 ABI，插件通过编译期注册。
+- 当前不做可缓存响应的端到端边转发边写缓存；可缓存 GET/HEAD miss 仍会收集完整 body 后处理。
+- 当前不实现跨进程共享内存缓存；只保留接口和一致性设计边界。
 
 ## 模块边界
 
@@ -37,6 +36,7 @@ Tavern RS 是一个缓存型反向代理/HTTP 代理。核心目标是：
 2. 本地请求进入 `/healthz/*`、`/version`、`/metrics`、`/cache/push`、`/debug/pprof` 或插件路由。
 3. 代理请求先交给插件 `handle_request`，插件未处理时进入中间件链。
 4. 中间件链按配置顺序执行，最后由 `UpstreamRoundTripper` 回源。
+5. 非 GET/HEAD 在 caching 中间件中直接旁路到下一层，完整转发请求体并返回 `X-Cache: BYPASS`。
 
 典型缓存链：
 
@@ -108,9 +108,10 @@ TTL 来源：
 
 1. base key 存储一个 vary index。
 2. 实际响应写入 `{base_key}#vary:{header=value|...}`。
-3. 后续请求先读取 base key，再根据 vary header 计算变体 key。
+3. storage `SharedKV` 写入 `vary/{base_key}` 到变体 key 列表的索引。
+4. 后续请求先读取 base key，再根据 vary header 计算变体 key。
 
-当前内存删除会同时删除 base key 和 vary 变体。落盘变体 GC 仍属于后续工作。
+内存删除会同时删除 base key 和 vary 变体。storage purge 和后台 GC 会读取 `vary/{base_key}`，同步删除落盘变体、目录索引和域名计数索引。
 
 ## Range 与分片
 
@@ -164,6 +165,44 @@ cache key -> SHA-1 -> chunk path
 
 未知 DB 类型会回退到 sled 并记录 warning。
 
+### 后台 GC
+
+`storage.gc` 控制后台过期对象清理：
+
+```yaml
+storage:
+  gc:
+    enabled: true
+    interval_secs: 60
+    batch_size: 1024
+```
+
+服务启动后会 spawn 一个 GC task，按间隔调用 `Storage::gc_expired(batch_size)`。当前 native storage 会遍历 bucket metadata，删除 `expires_at <= now` 的对象；如果过期对象是 Vary base index，会额外通过 `vary/{base_key}` 删除所有落盘变体。
+
+## 代理和流式转发
+
+服务响应体统一为 boxed body：
+
+- 缓存命中、管理接口和错误响应使用内存 bytes body。
+- 非 GET/HEAD 请求走缓存旁路，原始 `Incoming` request body 被传给 upstream client。
+- 旁路 upstream response body 不再 collect，直接映射为 boxed response body 返回给客户端。
+- 可缓存 GET/HEAD miss、Range 填充、revalidate 仍会 collect 完整 body，以保持现有缓存写入和分片逻辑稳定。
+
+## 上游负载均衡
+
+`upstream.address` 支持字符串和带权重对象：
+
+```yaml
+upstream:
+  balancing: wrr
+  address:
+    - "https://origin-a.example.com"
+    - address: "https://origin-b.example.com"
+      weight: 3
+```
+
+`weight` 默认是 1，配置为 0 会在启动校验中失败。`resolve_addresses: true` 时，解析出的每个 IP 节点继承原配置项的权重。
+
 ## 热冷分层
 
 `cache_tiers.enabled: true` 后启用热冷 bucket 迁移：
@@ -196,6 +235,8 @@ cache key -> SHA-1 -> chunk path
 - `PURGE <url>`
 - `Purge-Type: dir`
 
+单对象 PURGE 使用与缓存中间件相同的 cache key，并会同步清理 Vary 变体。
+
 ## 并发与保护
 
 - `collapsed_request` 使用 singleflight 合并同一 cache key 的并发 Miss。
@@ -218,6 +259,25 @@ cache key -> SHA-1 -> chunk path
 
 访问日志可输出到文件或 stdout，支持 AES-GCM 行加密。
 
+## 动态插件 ABI
+
+插件可以继续通过内置 registry 编译期注册，也可以通过配置加载动态库：
+
+```yaml
+plugin:
+  - name: custom-ffi-plugin
+    library: "/opt/tavern/plugins/libcustom_plugin.so"
+    options: {}
+```
+
+动态库导出：
+
+```c
+int32_t tavern_plugin_create_v1(const char *config_json, TavernPluginApiV1 *out);
+```
+
+`TavernPluginApiV1` 包含 ABI 版本、插件上下文指针，以及 `name`、`start`、`stop`、`handle_request`、`free_string`、`destroy` 函数指针。宿主只通过 C ABI 和 JSON 交换请求/响应元数据，不暴露 Rust trait object ABI。动态库 handle 会保存在插件实例里，确保函数指针生命周期不短于插件生命周期。
+
 ## 优雅升级
 
 服务监听 `SIGUSR1` 后会尝试 fork/exec 当前二进制，并通过环境变量传递监听 fd：
@@ -233,8 +293,6 @@ cache key -> SHA-1 -> chunk path
 
 ## 当前限制
 
-- 上游响应和缓存对象会被完整收集到内存，超大对象需要谨慎设置缓存策略和内存预算。
-- 非 GET/HEAD 请求在 caching 中间件下返回 `405`；即使绕过 caching，当前 upstream client 也不转发请求体。
-- 上游节点权重尚未从配置解析。
-- Vary 变体的落盘垃圾回收不完整。
-- 没有独立后台 expired-object GC。
+- 可缓存 GET/HEAD miss 仍会完整收集 upstream body 后写缓存，超大对象需要谨慎设置缓存策略和内存预算。
+- 动态插件 `handle_request` 当前接收请求元数据，不读取请求 body。
+- 共享内存缓存还没有 mmap/shm 实现；见 `docs/shared-cache-design.md`。

@@ -2,17 +2,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use http::{Request, Response};
-use http_body_util::Full;
 use hyper::body::Incoming;
 
+use crate::body::ResponseBody;
 use crate::config;
 
 pub trait Plugin: Send + Sync {
     fn name(&self) -> &str;
     fn add_router(&self, _router: &mut Router) {}
-    fn handle_request(&self, _req: &Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+    fn handle_request(&self, _req: &Request<Incoming>) -> Option<Response<ResponseBody>> {
         None
     }
     fn start(&self) -> Result<()> {
@@ -36,6 +35,14 @@ pub fn register(name: &str, ctor: PluginCtor) {
 }
 
 pub fn create(cfg: &config::Plugin) -> Result<Arc<dyn Plugin>> {
+    if cfg
+        .library
+        .as_deref()
+        .map(|library| !library.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return dynamic::load_plugin(cfg);
+    }
     let map = registry().lock().expect("plugin registry");
     let ctor = map
         .get(&cfg.name)
@@ -50,7 +57,7 @@ pub fn register_builtin() {
 }
 
 pub struct Router {
-    routes: HashMap<String, Arc<dyn Fn(Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync>>,
+    routes: HashMap<String, Arc<dyn Fn(Request<Incoming>) -> Response<ResponseBody> + Send + Sync>>,
 }
 
 impl Router {
@@ -62,23 +69,28 @@ impl Router {
 
     pub fn add<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request<Incoming>) -> Response<Full<Bytes>> + Send + Sync + 'static,
+        F: Fn(Request<Incoming>) -> Response<ResponseBody> + Send + Sync + 'static,
     {
         self.routes.insert(path.to_string(), Arc::new(handler));
     }
 
-    pub fn handle(&self, req: Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+    pub fn handle(&self, req: Request<Incoming>) -> Option<Response<ResponseBody>> {
         let path = req.uri().path().to_string();
         let handler = self.routes.get(&path)?;
         Some(handler(req))
     }
 
-    pub fn handle_path(&self, path: &str, req: Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+    pub fn handle_path(
+        &self,
+        path: &str,
+        req: Request<Incoming>,
+    ) -> Option<Response<ResponseBody>> {
         let handler = self.routes.get(path)?;
         Some(handler(req))
     }
 }
 
+pub mod dynamic;
 pub mod example;
 pub mod purge;
 pub mod verifier;

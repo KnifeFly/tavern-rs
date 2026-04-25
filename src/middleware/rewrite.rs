@@ -2,11 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
 use http::{HeaderMap, Request, Response};
-use http_body_util::Full;
 use hyper::body::Incoming;
 
+use crate::body::ResponseBody;
 use crate::config::MiddlewareConfig;
 use crate::middleware::registry::register;
 use crate::middleware::{Cleanup, Middleware, RoundTripper};
@@ -60,7 +59,7 @@ impl RoundTripper for RewriteMiddleware {
     fn round_trip(
         &self,
         mut req: Request<Incoming>,
-    ) -> crate::middleware::BoxFuture<Result<Response<Full<Bytes>>>> {
+    ) -> crate::middleware::BoxFuture<Result<Response<ResponseBody>>> {
         let next = Arc::clone(&self.next);
         let opts = self.opts.clone();
         Box::pin(async move {

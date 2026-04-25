@@ -1,11 +1,11 @@
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::body::{boxed_full, ResponseBody};
 use crate::middleware::caching;
 use crate::server::AppState;
 use crate::storage;
@@ -58,7 +58,7 @@ impl PushAction {
     }
 }
 
-pub(crate) async fn handle(req: Request<Incoming>, state: &AppState) -> Response<Full<Bytes>> {
+pub(crate) async fn handle(req: Request<Incoming>, state: &AppState) -> Response<ResponseBody> {
     if req.method() != Method::POST {
         return text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
@@ -285,21 +285,21 @@ fn resolve_urls(req: &PushRequest) -> Vec<String> {
     urls
 }
 
-fn text_response(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn text_response(status: StatusCode, msg: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "text/plain; charset=utf-8")
         .header("Content-Length", msg.len().to_string())
-        .body(Full::new(Bytes::from(msg.to_string())))
+        .body(boxed_full(Bytes::from(msg.to_string())))
         .unwrap()
 }
 
-fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Full<Bytes>> {
+fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<ResponseBody> {
     let payload = serde_json::to_vec(body).unwrap_or_default();
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json; charset=utf-8")
         .header("Content-Length", payload.len().to_string())
-        .body(Full::new(Bytes::from(payload)))
+        .body(boxed_full(Bytes::from(payload)))
         .unwrap()
 }

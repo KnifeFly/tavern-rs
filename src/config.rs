@@ -36,6 +36,17 @@ impl Bootstrap {
         if self.upstream.address.is_empty() {
             return Err(anyhow!("upstream.address must not be empty"));
         }
+        for addr in &self.upstream.address {
+            if addr.address().trim().is_empty() {
+                return Err(anyhow!("upstream.address contains an empty node"));
+            }
+            if addr.weight() == 0 {
+                return Err(anyhow!(
+                    "upstream.address node {} has invalid weight 0",
+                    addr.address()
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -127,7 +138,7 @@ pub struct Upstream {
     #[serde(default)]
     pub balancing: String,
     #[serde(default)]
-    pub address: Vec<String>,
+    pub address: Vec<UpstreamAddress>,
     #[serde(default)]
     pub max_idle_conns: usize,
     #[serde(default)]
@@ -140,6 +151,54 @@ pub struct Upstream {
     pub resolve_addresses: bool,
     #[serde(default)]
     pub features: HashMap<String, serde_yaml::Value>,
+}
+
+impl Upstream {
+    pub fn address_strings(&self) -> Vec<String> {
+        self.address
+            .iter()
+            .map(|addr| addr.address().to_string())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum UpstreamAddress {
+    Url(String),
+    Weighted {
+        address: String,
+        #[serde(default = "default_upstream_weight")]
+        weight: usize,
+    },
+}
+
+impl UpstreamAddress {
+    pub fn address(&self) -> &str {
+        match self {
+            UpstreamAddress::Url(addr) => addr,
+            UpstreamAddress::Weighted { address, .. } => address,
+        }
+    }
+
+    pub fn weight(&self) -> usize {
+        match self {
+            UpstreamAddress::Url(_) => default_upstream_weight(),
+            UpstreamAddress::Weighted { weight, .. } => *weight,
+        }
+    }
+}
+
+impl From<&str> for UpstreamAddress {
+    fn from(value: &str) -> Self {
+        Self::Url(value.to_string())
+    }
+}
+
+impl From<String> for UpstreamAddress {
+    fn from(value: String) -> Self {
+        Self::Url(value)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -165,7 +224,29 @@ pub struct Storage {
     #[serde(default)]
     pub io_burst_bytes: u64,
     #[serde(default)]
+    pub gc: StorageGc,
+    #[serde(default)]
     pub buckets: Vec<Bucket>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StorageGc {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_storage_gc_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_storage_gc_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for StorageGc {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_storage_gc_interval_secs(),
+            batch_size: default_storage_gc_batch_size(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -248,6 +329,18 @@ fn default_retry_backoff_ms() -> u64 {
     50
 }
 
+fn default_upstream_weight() -> usize {
+    1
+}
+
+fn default_storage_gc_interval_secs() -> u64 {
+    60
+}
+
+fn default_storage_gc_batch_size() -> usize {
+    1024
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct Bucket {
     #[serde(default)]
@@ -274,6 +367,8 @@ pub struct Bucket {
 pub struct Plugin {
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub library: Option<String>,
     #[serde(default)]
     pub options: HashMap<String, serde_yaml::Value>,
 }

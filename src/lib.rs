@@ -1,4 +1,5 @@
 pub mod access_log;
+pub mod body;
 pub mod cache;
 pub mod config;
 pub mod constants;

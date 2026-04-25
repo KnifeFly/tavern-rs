@@ -128,10 +128,11 @@ server:
 
 ```yaml
 upstream:
-  balancing: roundrobin
+  balancing: wrr
   address:
     - "https://origin-a.example.com"
-    - "https://origin-b.example.com"
+    - address: "https://origin-b.example.com"
+      weight: 3
   max_idle_conns: 1024
   max_idle_conns_per_host: 256
   max_connections_per_server: 512
@@ -142,7 +143,7 @@ upstream:
 ```
 
 - `balancing`：`roundrobin`、`random`、`wrr`。
-- `address`：上游地址；可包含 `http://` 或 `https://`。
+- `address`：上游地址；可包含 `http://` 或 `https://`。每项可以是字符串，也可以是 `{ address, weight }` 对象；未配置权重默认 `1`，`weight: 0` 会启动失败。
 - `resolve_addresses`：为 true 时启动时解析域名并将解析结果作为节点。
 - `insecure_skip_verify`：跳过 TLS 证书校验，只建议测试环境使用。
 
@@ -159,6 +160,10 @@ storage:
   io_read_limit: 0
   io_write_limit: 0
   io_burst_bytes: 0
+  gc:
+    enabled: true
+    interval_secs: 60
+    batch_size: 1024
   buckets:
     - driver: disk
       type: hot
@@ -181,6 +186,9 @@ storage:
 - `slice_size`：分片大小，0 时默认 1 MiB。
 - `io_read_limit` / `io_write_limit`：磁盘 bucket 读写限速，单位 bytes/s，0 表示不限速。
 - `io_burst_bytes`：读写限速的 burst token 上限，0 时使用读写限速中的较大值。
+- `gc.enabled`：是否启动后台过期对象清理任务。
+- `gc.interval_secs`：GC 扫描间隔，默认 60 秒。
+- `gc.batch_size`：单轮最多删除对象数，默认 1024；0 表示不限制。
 - `max_object_limit`：bucket 最大对象数，<= 0 时使用默认上限。
 
 ### cache_tiers
@@ -342,6 +350,18 @@ plugin:
 - `verifier`：提供校验相关能力。
 - `example`：示例插件。
 
+动态插件：
+
+```yaml
+plugin:
+  - name: custom-ffi-plugin
+    library: "/opt/tavern/plugins/libcustom_plugin.so"
+    options:
+      tenant: "default"
+```
+
+动态库必须导出 `tavern_plugin_create_v1`，宿主通过 C ABI v1 传入 JSON 配置。插件可以实现 `name`、`start`、`stop`、`handle_request` 和资源释放函数；`handle_request` 接收请求元数据 JSON，返回响应 JSON。动态插件不暴露 Rust trait object ABI。
+
 ## 部署建议
 
 - 使用磁盘 bucket 时，将 `storage.db_path` 和 bucket `path` 放在持久化目录。
@@ -367,11 +387,13 @@ curl -x http://127.0.0.1:8080 -I http://example.com/a.bin
 - `X-Cache: PART_MISS`：Range 请求需要继续回源。
 - `X-Cache: REVALIDATE_HIT`：过期后重验证，继续使用旧对象。
 - `X-Cache: REVALIDATE_MISS`：过期后上游返回新对象。
+- `X-Cache: BYPASS`：请求绕过缓存，通常是非 GET/HEAD 方法。
 
 常见问题：
 
-- `405 method not allowed`：启用 caching 中间件时只允许 GET/HEAD。
+- 非 GET/HEAD 请求没有命中缓存：这是预期行为，请检查上游是否收到完整请求体。
 - `upstream.address is empty`：配置缺少上游地址。
+- `upstream.address node ... has invalid weight 0`：上游节点权重必须大于 0。
 - `invalid host`：请求没有 authority，也没有 Host header。
 - Range 返回 416：请求范围超出对象大小。
 - `/cache/push` 404：请求 Host 没有命中本地管理 Host，添加 `-H "Host: localhost"`。

@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::Full;
 use hyper::body::Incoming;
 use log::warn;
 use serde::Deserialize;
 
+use crate::body::{boxed_full, empty_body, ResponseBody};
 use crate::config;
 use crate::constants;
 use crate::plugin::Plugin;
@@ -61,12 +61,12 @@ impl Plugin for PurgePlugin {
                 .header("Content-Type", "application/json")
                 .header("Content-Length", "0")
                 .header("X-Device-Plugin", "purger")
-                .body(Full::new(Bytes::new()))
+                .body(empty_body())
                 .unwrap()
         });
     }
 
-    fn handle_request(&self, req: &Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+    fn handle_request(&self, req: &Request<Incoming>) -> Option<Response<ResponseBody>> {
         if req.method().as_str() != METHOD_PURGE {
             return None;
         }
@@ -195,19 +195,19 @@ fn decode_options(cfg: &config::Plugin) -> Result<PurgeOptions> {
     Ok(serde_yaml::from_value(val)?)
 }
 
-fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+fn empty_response(status: StatusCode) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::new()))
+        .body(empty_body())
         .unwrap()
 }
 
-fn json_response(status: StatusCode, payload: &str) -> Response<Full<Bytes>> {
+fn json_response(status: StatusCode, payload: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json; charset=utf-8")
         .header("Content-Length", payload.len().to_string())
-        .body(Full::new(Bytes::from(payload.to_string())))
+        .body(boxed_full(Bytes::from(payload.to_string())))
         .unwrap()
 }
 

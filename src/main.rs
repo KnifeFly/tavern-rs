@@ -71,7 +71,10 @@ fn start_config_watcher(path: PathBuf) {
         use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
         use std::sync::mpsc::channel;
 
-        let dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let filename = path.file_name().map(|s| s.to_os_string());
         std::thread::spawn(move || {
             let (tx, rx) = channel();
@@ -96,7 +99,11 @@ fn start_config_watcher(path: PathBuf) {
                     }
                 };
                 if let Some(name) = filename.as_ref() {
-                    if !event.paths.iter().any(|p| p.file_name() == Some(name.as_ref())) {
+                    if !event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name() == Some(name.as_ref()))
+                    {
                         continue;
                     }
                 }

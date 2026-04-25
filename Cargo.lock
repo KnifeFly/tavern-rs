@@ -2262,6 +2262,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "indexmap",
+ "libloading",
  "log",
  "md5",
  "nix",
